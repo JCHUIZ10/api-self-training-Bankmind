@@ -1,12 +1,12 @@
 # src/morosidad/training_service.py
 import logging
 import time
-import base64
+import gc
 import io
+import os
 import joblib
-
-import numpy as np
 import pandas as pd
+import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, accuracy_score, precision_score,
@@ -17,15 +17,18 @@ import xgboost as xgb
 import lightgbm as lgb
 import optuna
 import shap
+import mlflow
 
+# Imports locales
 from morosidad.morosidad_schema import (
     TrainingRequest, TrainingResponse,
     TrainingMetrics, OptunaResult
 )
+from morosidad import dagshub_client
+from morosidad import data_loader
 
 logger = logging.getLogger(__name__)
 
-# Orden exacto de las columnas que espera el modelo
 FEATURE_COLUMNS = [
     'LIMIT_BAL', 'SEX', 'EDUCATION', 'MARRIAGE', 'AGE',
     'PAY_0', 'PAY_2', 'PAY_3', 'PAY_4', 'PAY_5', 'PAY_6',
@@ -34,9 +37,7 @@ FEATURE_COLUMNS = [
     'UTILIZATION_RATE'
 ]
 
-
 def calcular_ks_statistic(y_true, y_proba):
-    """Calcula la estadística KS (Kolmogorov-Smirnov)."""
     from scipy.stats import ks_2samp
     pos_proba = y_proba[y_true == 1]
     neg_proba = y_proba[y_true == 0]
@@ -45,285 +46,357 @@ def calcular_ks_statistic(y_true, y_proba):
     ks_stat, _ = ks_2samp(pos_proba, neg_proba)
     return float(ks_stat)
 
+def calcular_baseline_distributions(df: pd.DataFrame) -> dict:
+    features = ['PAY_0', 'PAY_2', 'PAY_3', 'LIMIT_BAL', 'BILL_AMT1', 'UTILIZATION_RATE']
+    dists = {}
+    for col in features:
+        if col not in df.columns: continue
+        data = df[col].dropna()
+        if col.startswith('PAY_'):
+            counts = data.value_counts(normalize=True).sort_index()
+            dists[col] = {"type": "categorical", "values": [int(x) for x in counts.index], "probs": counts.values.tolist()}
+        else:
+            counts, edges = np.histogram(data, bins=10, density=False)
+            dists[col] = {"type": "continuous", "bins": edges.tolist(), "probs": (counts/len(data)).tolist()}
+    return dists
 
-def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
-    """
-    Pipeline completo de entrenamiento:
-    1. Preparar datos
-    2. Optimizar con Optuna
-    3. Entrenar ensemble final
-    4. Calcular métricas
-    5. Serializar modelo
-    """
+def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
     start_time = time.time()
-    logger.info(f"🚀 Iniciando entrenamiento con {len(request.samples)} muestras")
+    n_trials = request.optuna_trials
+    logger.info(f"🚀 Iniciando Auto-Entrenamiento (Trials={n_trials})")
 
-    # =========================================
-    # 1. PREPARAR DATOS
-    # =========================================
-    samples_dicts = [s.model_dump() for s in request.samples]
-    df = pd.DataFrame(samples_dicts)
+    dagshub_client.init_dagshub_connection()
+    mlflow.set_experiment("morosidad_auto_training")
 
-    X = df[FEATURE_COLUMNS].copy()
-    y = df['default_payment_next_month'].copy()
-    weights = df['sample_weight'].values
+    champ_model = None
+    ensemble_model = None
 
-    # Distribución de clases
-    class_dist = y.value_counts().to_dict()
-    class_dist = {str(k): int(v) for k, v in class_dist.items()}
-    logger.info(f"📊 Distribución de clases: {class_dist}")
-
-    # Scale pos weight dinámico
-    n_negative = int((y == 0).sum())
-    n_positive = int((y == 1).sum())
-    scale_pos_weight = n_negative / max(n_positive, 1)
-    logger.info(f"⚖️ scale_pos_weight calculado: {scale_pos_weight:.4f}")
-
-    # Split estratificado
-    X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-        X, y, weights, test_size=0.2, random_state=42, stratify=y
-    )
-
-    logger.info(f"📂 Train: {len(X_train)} | Test: {len(X_test)}")
-
-    # =========================================
-    # 2. OPTIMIZAR CON OPTUNA
-    # =========================================
-    logger.info(f"🔍 Iniciando optimización Optuna ({request.optuna_trials} trials)...")
-
-    # Silenciar los logs de Optuna
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
-
-    def objective(trial):
-        """Función objetivo para Optuna: optimiza AUC-ROC del ensemble."""
-
-        # Hiperparámetros XGBoost
-        xgb_params = {
-            'learning_rate': trial.suggest_float('xgb_learning_rate', 0.01, 0.2),
-            'max_depth': trial.suggest_int('xgb_max_depth', 3, 10),
-            'n_estimators': trial.suggest_int('xgb_n_estimators', 100, 800),
-            'subsample': trial.suggest_float('xgb_subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('xgb_colsample_bytree', 0.6, 1.0),
-            'scale_pos_weight': scale_pos_weight,
-            'objective': 'binary:logistic',
-            'eval_metric': 'auc',
-            'random_state': 42,
-            'verbosity': 0
-        }
-
-        # Hiperparámetros LightGBM
-        lgbm_params = {
-            'learning_rate': trial.suggest_float('lgbm_learning_rate', 0.01, 0.2),
-            'num_leaves': trial.suggest_int('lgbm_num_leaves', 20, 60),
-            'n_estimators': trial.suggest_int('lgbm_n_estimators', 100, 800),
-            'scale_pos_weight': scale_pos_weight,
-            'objective': 'binary',
-            'metric': 'auc',
-            'random_state': 42,
-            'verbose': -1
-        }
-
-        # Hiperparámetros Random Forest
-        rf_params = {
-            'n_estimators': trial.suggest_int('rf_n_estimators', 50, 300),
-            'max_depth': trial.suggest_int('rf_max_depth', 5, 15),
-            'class_weight': 'balanced',
-            'random_state': 42
-        }
-
-        # Pesos del ensemble
-        w_xgb = trial.suggest_int('ensemble_weight_xgb', 1, 5)
-        w_lgbm = trial.suggest_int('ensemble_weight_lgbm', 1, 3)
-        w_rf = trial.suggest_int('ensemble_weight_rf', 1, 2)
-
-        # Crear ensemble
-        ensemble = VotingClassifier(
+    try:
+        # ═══════════════════════════════════════════
+        # 1. CARGAR DATOS DESDE POSTGRESQL
+        # ═══════════════════════════════════════════
+        df = data_loader.load_training_data()
+        if df is None or df.empty:
+            raise ValueError("No se obtuvieron datos para entrenar.")
+            
+        X = df[FEATURE_COLUMNS].copy()
+        y = df['DEFAULT_PAYMENT_NEXT_MONTH'].copy()
+        
+        n_neg, n_pos = (y==0).sum(), (y==1).sum()
+        scale_pos_weight = n_neg / max(n_pos, 1)
+        
+        # Split: 60% train, 20% val (early stopping), 20% test
+        X_train_full, X_test, y_train_full, y_test, w_train_full, w_test = train_test_split(
+            X, y, df['SAMPLE_WEIGHT'], test_size=0.2, random_state=42, stratify=y
+        )
+        X_train, X_val, y_train, y_val, w_train, w_val = train_test_split(
+            X_train_full, y_train_full, w_train_full, test_size=0.25, random_state=42, stratify=y_train_full
+        )
+        logger.info(f"📊 Datos: train={len(X_train)}, val={len(X_val)}, test={len(X_test)}")
+        
+        # ═══════════════════════════════════════════
+        # 2. OPTUNA — OPTIMIZAR XGBOOST
+        # ═══════════════════════════════════════════
+        xgb_trials = max(n_trials // 2, 2)
+        logger.info(f"🔍 Optimizando XGBoost ({xgb_trials} trials)...")
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        
+        def objective_xgb(trial):
+            params = {
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'max_depth': trial.suggest_int('max_depth', 3, 8),
+                'n_estimators': trial.suggest_int('n_estimators', 100, 400),
+                'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                'scale_pos_weight': scale_pos_weight,
+                'objective': 'binary:logistic',
+                'eval_metric': 'auc',
+                'verbosity': 0,
+                'n_jobs': -1,
+                'early_stopping_rounds': 20
+            }
+            model = xgb.XGBClassifier(**params)
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+            return roc_auc_score(y_test, model.predict_proba(X_test)[:,1], sample_weight=w_test)
+        
+        study_xgb = optuna.create_study(direction='maximize')
+        study_xgb.optimize(objective_xgb, n_trials=xgb_trials)
+        logger.info(f"✅ Mejor AUC XGBoost: {study_xgb.best_value:.4f}")
+        
+        # ═══════════════════════════════════════════
+        # 3. OPTUNA — OPTIMIZAR LIGHTGBM
+        # ═══════════════════════════════════════════
+        lgbm_trials = max(n_trials - xgb_trials, 2)
+        logger.info(f"🔍 Optimizando LightGBM ({lgbm_trials} trials)...")
+        
+        def objective_lgbm(trial):
+            params = {
+                'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3),
+                'num_leaves': trial.suggest_int('num_leaves', 20, 100),
+                'n_estimators': trial.suggest_int('n_estimators', 100, 400),
+                'min_child_samples': trial.suggest_int('min_child_samples', 10, 100),
+                'subsample': trial.suggest_float('subsample', 0.6, 1.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
+                'reg_alpha': trial.suggest_float('reg_alpha', 0.0, 10.0),
+                'reg_lambda': trial.suggest_float('reg_lambda', 0.0, 10.0),
+                'scale_pos_weight': scale_pos_weight,
+                'objective': 'binary',
+                'metric': 'auc',
+                'verbose': -1,
+                'n_jobs': -1
+            }
+            model = lgb.LGBMClassifier(**params)
+            callbacks = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+            model.fit(X_train, y_train, eval_set=[(X_val, y_val)], eval_metric="auc", callbacks=callbacks)
+            return roc_auc_score(y_test, model.predict_proba(X_test)[:,1], sample_weight=w_test)
+        
+        study_lgbm = optuna.create_study(direction='maximize')
+        study_lgbm.optimize(objective_lgbm, n_trials=lgbm_trials)
+        logger.info(f"✅ Mejor AUC LightGBM: {study_lgbm.best_value:.4f}")
+        
+        # ═══════════════════════════════════════════
+        # 4. ENTRENAR CHAMPIONS INDIVIDUALES
+        # ═══════════════════════════════════════════
+        logger.info("🏗️ Entrenando modelos Champion...")
+        
+        # XGBoost Champion
+        best_xgb_params = study_xgb.best_params
+        xgb_champion = xgb.XGBClassifier(
+            **best_xgb_params, scale_pos_weight=scale_pos_weight,
+            objective='binary:logistic', eval_metric='auc', verbosity=0, n_jobs=-1
+        )
+        xgb_champion.fit(X_train_full, y_train_full)
+        
+        # LightGBM Champion
+        best_lgbm_params = study_lgbm.best_params
+        lgbm_champion = lgb.LGBMClassifier(
+            **best_lgbm_params, scale_pos_weight=scale_pos_weight,
+            objective='binary', metric='auc', verbose=-1, n_jobs=-1
+        )
+        lgbm_champion.fit(X_train_full, y_train_full)
+        
+        # RandomForest (params fijos, sin Optuna)
+        rf_model = RandomForestClassifier(
+            n_estimators=80, max_depth=8,
+            class_weight='balanced', random_state=42, n_jobs=-1
+        )
+        rf_model.fit(X_train_full, y_train_full)
+        
+        # ═══════════════════════════════════════════
+        # 5. ENSAMBLAR MODELO FINAL
+        # ═══════════════════════════════════════════
+        logger.info("🔗 Construyendo Ensamble Final...")
+        ensemble_model = VotingClassifier(
             estimators=[
-                ('xgboost', xgb.XGBClassifier(**xgb_params)),
-                ('lightgbm', lgb.LGBMClassifier(**lgbm_params)),
-                ('rf', RandomForestClassifier(**rf_params))
+                ('xgb', xgb_champion),
+                ('lgbm', lgbm_champion),
+                ('rf', rf_model)
             ],
             voting='soft',
-            weights=[w_xgb, w_lgbm, w_rf]
+            weights=[2, 1, 1],  # XGB vale x2
+            n_jobs=-1
         )
-
-        ensemble.fit(X_train, y_train, sample_weight=w_train)
-        y_proba = ensemble.predict_proba(X_test)[:, 1]
-        auc = roc_auc_score(y_test, y_proba, sample_weight=w_test)
-        return auc
-
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=request.optuna_trials)
-
-    best_trial = study.best_trial
-    best_params = best_trial.params
-    logger.info(f"✅ Mejor trial #{best_trial.number}: AUC = {best_trial.value:.4f}")
-
-    # =========================================
-    # 3. ENTRENAR MODELO FINAL CON MEJORES PARÁMETROS
-    # =========================================
-    logger.info("🏗️ Entrenando modelo final con los mejores parámetros...")
-
-    xgb_final = xgb.XGBClassifier(
-        learning_rate=best_params['xgb_learning_rate'],
-        max_depth=best_params['xgb_max_depth'],
-        n_estimators=best_params['xgb_n_estimators'],
-        subsample=best_params['xgb_subsample'],
-        colsample_bytree=best_params['xgb_colsample_bytree'],
-        scale_pos_weight=scale_pos_weight,
-        objective='binary:logistic',
-        eval_metric='auc',
-        random_state=42,
-        verbosity=0
-    )
-
-    lgbm_final = lgb.LGBMClassifier(
-        learning_rate=best_params['lgbm_learning_rate'],
-        num_leaves=best_params['lgbm_num_leaves'],
-        n_estimators=best_params['lgbm_n_estimators'],
-        scale_pos_weight=scale_pos_weight,
-        objective='binary',
-        metric='auc',
-        random_state=42,
-        verbose=-1
-    )
-
-    rf_final = RandomForestClassifier(
-        n_estimators=best_params['rf_n_estimators'],
-        max_depth=best_params['rf_max_depth'],
-        class_weight='balanced',
-        random_state=42
-    )
-
-    w_xgb = best_params['ensemble_weight_xgb']
-    w_lgbm = best_params['ensemble_weight_lgbm']
-    w_rf = best_params['ensemble_weight_rf']
-
-    final_ensemble = VotingClassifier(
-        estimators=[
-            ('xgboost', xgb_final),
-            ('lightgbm', lgbm_final),
-            ('rf', rf_final)
-        ],
-        voting='soft',
-        weights=[w_xgb, w_lgbm, w_rf]
-    )
-
-    final_ensemble.fit(X_train, y_train, sample_weight=w_train)
-
-    # =========================================
-    # 4. CALCULAR MÉTRICAS
-    # =========================================
-    logger.info("📏 Calculando métricas sobre el test set...")
-
-    y_proba = final_ensemble.predict_proba(X_test)[:, 1]
-    y_pred = final_ensemble.predict(X_test)
-
-    auc_roc = roc_auc_score(y_test, y_proba, sample_weight=w_test)
-    ks_stat = calcular_ks_statistic(y_test.values, y_proba)
-    gini = 2 * auc_roc - 1
-
-    training_time = time.time() - start_time
-
-    metrics = TrainingMetrics(
-        auc_roc=round(auc_roc, 4),
-        ks_statistic=round(ks_stat, 4),
-        gini_coefficient=round(gini, 4),
-        accuracy=round(accuracy_score(y_test, y_pred, sample_weight=w_test), 4),
-        precision=round(precision_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
-        recall=round(recall_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
-        f1_score=round(f1_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
-        training_time_sec=round(training_time, 2)
-    )
-
-    logger.info(f"📊 Métricas: AUC={metrics.auc_roc} | KS={metrics.ks_statistic} | "
-                f"Gini={metrics.gini_coefficient} | F1={metrics.f1_score}")
-
-    # =========================================
-    # 5. CREAR SHAP EXPLAINER
-    # =========================================
-    logger.info("🔬 Creando SHAP explainer...")
-    xgb_model = final_ensemble.named_estimators_['xgboost']
-    try:
-        explainer = shap.TreeExplainer(xgb_model)
-        logger.info("✅ SHAP explainer creado correctamente")
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo crear SHAP explainer: {e}")
-        explainer = None
-
-    # =========================================
-    # 6. SERIALIZAR MODELO
-    # =========================================
-    logger.info("📦 Serializando modelo...")
-
-    model_package = {
-        'modelo_prediccion': final_ensemble,
-        'shap_explainer': explainer,
-        'meta_info': {
-            'version': 'auto-trained',
-            'features': FEATURE_COLUMNS,
-            'scale_pos_weight': scale_pos_weight,
-            'training_samples': len(X_train),
-            'auc_roc': metrics.auc_roc
-        }
-    }
-
-    buffer = io.BytesIO()
-    joblib.dump(model_package, buffer)
-    model_bytes = base64.b64encode(buffer.getvalue()).decode('utf-8')
-    logger.info(f"📦 Modelo serializado: {len(model_bytes)} caracteres base64")
-
-    # =========================================
-    # 7. CONSTRUIR RESPONSE
-    # =========================================
-    assembly_config = {
-        "architecture": "VotingClassifier",
-        "voting_strategy": "soft",
-        "weights_assigned": [w_xgb, w_lgbm, w_rf],
-        "order_estimators": ["xgboost", "lightgbm", "rf"],
-        "random_seed": 42,
-        "features_input": FEATURE_COLUMNS,
-        "internal_components": {
-            "xgboost": {
-                "learning_rate": best_params['xgb_learning_rate'],
-                "max_depth": best_params['xgb_max_depth'],
-                "n_estimators": best_params['xgb_n_estimators'],
-                "subsample": best_params['xgb_subsample'],
-                "colsample_bytree": best_params['xgb_colsample_bytree'],
-                "scale_pos_weight": scale_pos_weight
-            },
-            "lightgbm": {
-                "learning_rate": best_params['lgbm_learning_rate'],
-                "num_leaves": best_params['lgbm_num_leaves'],
-                "n_estimators": best_params['lgbm_n_estimators'],
-                "scale_pos_weight": scale_pos_weight
-            },
-            "rf": {
-                "n_estimators": best_params['rf_n_estimators'],
-                "max_depth": best_params['rf_max_depth'],
-                "class_weight": "balanced"
+        # VotingClassifier requiere fit() aunque los estimadores ya estén entrenados
+        # Le pasamos los datos para que configure los atributos internos
+        ensemble_model.fit(X_train_full, y_train_full)
+        
+        # ═══════════════════════════════════════════
+        # 6. CALCULAR MÉTRICAS DEL ENSAMBLE
+        # ═══════════════════════════════════════════
+        y_prob = ensemble_model.predict_proba(X_test)[:,1]
+        y_pred = ensemble_model.predict(X_test)
+        auc_score = roc_auc_score(y_test, y_prob, sample_weight=w_test)
+        ks_score = calcular_ks_statistic(y_test.values, y_prob)
+        
+        metrics = TrainingMetrics(
+            auc_roc=round(auc_score, 4), ks_statistic=round(ks_score, 4),
+            gini_coefficient=round(2*auc_score-1, 4),
+            accuracy=round(accuracy_score(y_test, y_pred, sample_weight=w_test), 4),
+            precision=round(precision_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
+            recall=round(recall_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
+            f1_score=round(f1_score(y_test, y_pred, sample_weight=w_test, zero_division=0), 4),
+            training_time_sec=round(time.time()-start_time, 2)
+        )
+        logger.info(f"📊 Ensamble AUC: {auc_score:.4f} | KS: {ks_score:.4f}")
+        
+        # ═══════════════════════════════════════════
+        # 7. COMPARAR CON CHAMPION DE DAGSHUB
+        # ═══════════════════════════════════════════
+        logger.info("⚔️ Comparando con el Champion actual...")
+        champ_model, _, champ_meta = dagshub_client.download_current_champion()
+        champ_auc = 0.0
+        
+        if champ_model:
+            try:
+                yp_champ = champ_model.predict_proba(X_test)[:,1]
+                champ_auc = roc_auc_score(y_test, yp_champ, sample_weight=w_test)
+                logger.info(f"📊 Champion AUC: {champ_auc:.4f} | Challenger AUC: {auc_score:.4f}")
+            except Exception as e:
+                logger.warning(f"⚠️ Error evaluando Champion: {e}")
+        else:
+            logger.info("ℹ️ No se encontró Champion (Cold Start). El Challenger será promovido.")
+            
+        # ═══════════════════════════════════════════
+        # 8. DECISIÓN DE PROMOCIÓN + COMBO-PACK
+        # ═══════════════════════════════════════════
+        auc_diff = auc_score - champ_auc
+        status = "KEEP_CHAMPION"
+        assembly_config = None
+        dagshub_verified = False
+        version_tag = f"v_{int(time.time())}"
+        
+        if auc_diff > 0.015 or champ_model is None:
+            status = "NEW_CHAMPION"
+            logger.info(f"🏆 NUEVO CHAMPION DETECTADO (+{auc_diff:.4f} AUC)")
+            
+            # Extraer XGBoost interno para SHAP
+            logger.info("🧠 Creando SHAP Explainer...")
+            try:
+                xgb_interno = ensemble_model.named_estimators_['xgb']
+                explainer = shap.TreeExplainer(xgb_interno)
+            except Exception as e:
+                logger.warning(f"⚠️ No se pudo crear SHAP explainer: {e}")
+                explainer = None
+            
+            # Empaquetar combo-pack (modelo + SHAP + meta)
+            pkg = {
+                'modelo_prediccion': ensemble_model,
+                'shap_explainer': explainer,
+                'meta_info': {
+                    'version': version_tag,
+                    'auc_roc': metrics.auc_roc,
+                    'ks_statistic': metrics.ks_statistic,
+                    'descripcion': 'Ensamble XGB+LGBM+RF con SHAP embebido'
+                }
             }
-        }
-    }
-
-    optuna_result = OptunaResult(
-        trial_number=best_trial.number,
-        objective_value=round(best_trial.value, 4),
-        metric_optimized="auc_roc",
-        best_params=best_params
-    )
-
-    response = TrainingResponse(
-        metrics=metrics,
-        optuna_result=optuna_result,
-        model_base64=model_bytes,
-        assembly_config=assembly_config,
-        total_samples=len(df),
-        train_samples=len(X_train),
-        test_samples=len(X_test),
-        class_distribution=class_dist,
-        scale_pos_weight=round(scale_pos_weight, 4)
-    )
-
-    logger.info(f"✅ Entrenamiento completado en {training_time:.1f}s")
-    return response
+            buf_pkg = io.BytesIO()
+            joblib.dump(pkg, buf_pkg)
+            
+            # ═══════════════════════════════════════════
+            # UPLOAD TRANSACCIONAL
+            # ═══════════════════════════════════════════
+            
+            # Paso 1: Upload a DagsHub
+            upload_ok = dagshub_client.upload_champion(buf_pkg.getvalue(), f"challenger-{version_tag}")
+            
+            if not upload_ok:
+                status = "UPLOAD_FAILED"
+                logger.error("❌ ABORT: Falló el upload a DagsHub. No se promociona.")
+            else:
+                # Paso 2: Verificar integridad re-descargando
+                integrity_ok = dagshub_client.verify_champion_integrity(version_tag)
+                
+                if not integrity_ok:
+                    status = "UPLOAD_FAILED"
+                    logger.error("❌ ABORT: Verificación de integridad falló. Modelo corrupto o no disponible.")
+                else:
+                    dagshub_verified = True
+                    logger.info("✅ Upload + Verificación OK — Modelo listo para promoción")
+            
+            # Construir assembly_config solo si verificado
+            if dagshub_verified:
+                assembly_config = {
+                    "architecture": "VotingClassifier",
+                    "voting_strategy": "soft",
+                    "weights_assigned": [2, 1, 1],
+                    "order_estimators": ["xgboost_champion", "lightgbm_champion", "rf_base"],
+                    "random_seed": 42,
+                    "features_input": FEATURE_COLUMNS,
+                    "internal_components": {
+                        "xgboost_champion": {k: v for k, v in best_xgb_params.items()},
+                        "lightgbm_champion": {k: v for k, v in best_lgbm_params.items()},
+                        "rf_base": {"n_estimators": 80, "max_depth": 8, "class_weight": "balanced"}
+                    }
+                }
+        else:
+            logger.info(f"📉 Champion se mantiene (diff={auc_diff:.4f}, umbral=0.015)")
+        
+        # Log MLflow solo si la operación fue exitosa (no UPLOAD_FAILED)
+        if status != "UPLOAD_FAILED":
+            import tempfile as _tmpf
+            
+            # Nombre descriptivo del run: "champion_v_1234" o "keep_champion_v_1234"
+            run_name = f"{'champion' if status == 'NEW_CHAMPION' else 'keep_champion'}_{version_tag}"
+            mlflow.start_run(run_name=run_name)
+            
+            # Params de ambos modelos
+            mlflow.log_params({f"xgb_{k}": v for k, v in best_xgb_params.items()})
+            mlflow.log_params({f"lgbm_{k}": v for k, v in best_lgbm_params.items()})
+            mlflow.log_param("deployment_status", status)
+            mlflow.log_param("version_tag", version_tag)
+            
+            # Métricas del ensamble
+            mlflow.log_metrics({
+                "ensemble_auc": auc_score, "ensemble_ks": ks_score,
+                "gini_coefficient": 2 * auc_score - 1,
+                "xgb_best_auc": study_xgb.best_value, "lgbm_best_auc": study_lgbm.best_value
+            })
+            
+            # Guardar modelo como artefacto de MLflow
+            if status == "NEW_CHAMPION":
+                try:
+                    with _tmpf.NamedTemporaryFile(suffix=".pkl", prefix=f"modelo_{version_tag}_", delete=False) as f:
+                        buf_mlflow = io.BytesIO()
+                        joblib.dump(pkg, buf_mlflow)
+                        f.write(buf_mlflow.getvalue())
+                        artifact_path = f.name
+                    mlflow.log_artifact(artifact_path, artifact_path="champion_model")
+                    os.remove(artifact_path)
+                    logger.info("📦 Modelo guardado como artefacto en MLflow")
+                except Exception as e:
+                    logger.warning(f"⚠️ No se pudo guardar artefacto MLflow: {e}")
+            
+            mlflow.end_run()
+            logger.info(f"✅ Run '{run_name}' registrado en MLflow")
+        else:
+            logger.warning("⚠️ MLflow logging omitido (upload fallido)")
+            
+        # ═══════════════════════════════════════════
+        # 9. RESPUESTA AL BACKEND
+        # ═══════════════════════════════════════════
+        all_best_params = {**best_xgb_params, **{f"lgbm_{k}": v for k, v in best_lgbm_params.items()}}
+        
+        # Generar info de columnas (matching DetalleColumna POJO)
+        columns_info = [
+            {"name": col, "date_type": str(df[col].dtype).upper(), "rol": "FEATURE", "description": None, "is_nullable": False}
+            for col in FEATURE_COLUMNS
+        ]
+        columns_info.append({
+            "name": "DEFAULT_PAYMENT_NEXT_MONTH", "date_type": "INTEGER", "rol": "TARGET",
+            "description": "Variable Objetivo (1=Moroso, 0=No Moroso)", "is_nullable": False
+        })
+        columns_info.append({
+            "name": "SAMPLE_WEIGHT", "date_type": "FLOAT", "rol": "WEIGHT",
+            "description": "Peso temporal para decay", "is_nullable": False
+        })
+        
+        # Obtener fecha inicio del dataset
+        dataset_start = data_loader.get_dataset_start_date()
+        
+        return TrainingResponse(
+            metrics=metrics,
+            optuna_result=OptunaResult(
+                best_value=auc_score,
+                best_params=all_best_params,
+                n_trials=xgb_trials + lgbm_trials
+            ),
+            total_samples=len(df), train_samples=len(X_train_full), test_samples=len(X_test),
+            baseline_distributions=calcular_baseline_distributions(df),
+            assembly_config=assembly_config,
+            columns_info=columns_info,
+            dataset_start_date=dataset_start,
+            dagshub_verified=dagshub_verified,
+            version_tag=version_tag,
+            deployment_status=status
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Error Pipeline: {e}")
+        raise e
+    finally:
+        # Limpieza de modelos en memoria
+        del champ_model, ensemble_model
+        gc.collect()
