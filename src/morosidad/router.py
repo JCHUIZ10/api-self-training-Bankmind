@@ -3,41 +3,21 @@ import logging
 from fastapi import APIRouter, HTTPException
 
 from morosidad.morosidad_schema import TrainingRequest, TrainingResponse
-from morosidad.training_service import entrenar_modelo
+from morosidad import training_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/morosidad", tags=["Morosidad - Self Training"])
 
-
 @router.post("/train", response_model=TrainingResponse)
-async def train_model(request: TrainingRequest):
+def train_model_endpoint(request: TrainingRequest):
     """
-    Entrena un modelo candidato de morosidad con los datos proporcionados.
-
-    El backend Java envía el dataset completo (extraído de la vista materializada).
-    Esta API se encarga de:
-    1. Optimizar hiperparámetros con Optuna
-    2. Entrenar un ensemble (XGBoost + LightGBM + RF)
-    3. Calcular métricas de evaluación
-    4. Retornar el modelo serializado + métricas
+    Endpoint para iniciar el auto-entrenamiento (Orquestación Python).
     """
-    if not request.samples:
-        raise HTTPException(status_code=400, detail="El dataset no puede estar vacío")
-
-    if len(request.samples) < 100:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Dataset muy pequeño ({len(request.samples)} muestras). Se requieren al menos 100."
-        )
-
-    logger.info(f"📡 Solicitud de entrenamiento recibida: {len(request.samples)} muestras, "
-                f"{request.optuna_trials} trials Optuna")
+    logger.info(f"📡 Solicitud de entrenamiento recibida (Trials={request.optuna_trials})")
 
     try:
-        response = entrenar_modelo(request)
-        logger.info(f"✅ Entrenamiento exitoso. AUC: {response.metrics.auc_roc}")
-        return response
+        return training_service.ejecutar_autoentrenamiento(request)
     except Exception as e:
         logger.error(f"❌ Error durante el entrenamiento: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error en entrenamiento: {str(e)}")
