@@ -161,3 +161,50 @@ class SelfTrainingAuditFraud(Base):
     
     def __repr__(self):
         return f"<SelfTrainingAuditFraud(id={self.id_audit}, model_id={self.id_model}, status='{self.promotion_status}')>"
+
+
+class ModelFeatureDrift(Base):
+    """
+    Registro de PSI por feature para el modelo CHAMPION.
+    Alimenta la gráfica de evolución del drift en el Frontend.
+
+    Tabla: model_feature_drift
+    """
+    __tablename__ = 'model_feature_drift'
+
+    id_drift = Column(BigInteger, primary_key=True, autoincrement=True)
+
+    # FK → fraud_models
+    id_model = Column(
+        BigInteger,
+        ForeignKey('fraud_models.id_model', ondelete='CASCADE'),
+        nullable=False
+    )
+
+    # Feature medido: 'amt', 'city_pop', 'age', 'distance_km', 'hour', etc.
+    feature_name = Column(String(50), nullable=False)
+
+    # Valor PSI  (0 = sin drift, > 0.25 = drift severo)
+    # NUMERIC(10,6): hasta 9999.999999 — cubre PSI extremos (e.g. amt=21.84)
+    psi_value = Column(Numeric(10, 6), nullable=False)
+
+    # Categoría interpretada: 'LOW' | 'MODERATE' | 'HIGH'
+    drift_category = Column(String(20))
+
+    # Timestamp automático de la medición (Eje X de la gráfica)
+    measured_at = Column(TIMESTAMP, default=datetime.utcnow)
+
+    # Índice compuesto para queries de la gráfica
+    __table_args__ = (
+        Index('idx_drift_model_date', 'id_model', 'measured_at'),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ModelFeatureDrift(id={self.id_drift}, "
+            f"model={self.id_model}, "
+            f"feature='{self.feature_name}', "
+            f"psi={self.psi_value}, "
+            f"category='{self.drift_category}')>"
+        )
+

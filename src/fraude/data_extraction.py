@@ -101,9 +101,7 @@ def extract_and_balance_data(
         result_row = cursor.fetchone()
         cursor.close()
         
-        # Debug: verificar tipo de result_row
-        logger.info(f"🔍 DEBUG - Tipo de result_row: {type(result_row)}")
-        logger.info(f"🔍 DEBUG - Contenido de result_row: {result_row}")
+
         
         # Extraer el valor dependiendo del tipo de resultado
         if isinstance(result_row, dict):
@@ -235,3 +233,63 @@ def validate_date_range(start_date: str, end_date: str):
         
     except ValueError as e:
         raise ValueError(f"Formato de fecha inválido. Use 'YYYY-MM-DD'. Error: {e}")
+
+
+def get_raw_transactions(start_date: str, end_date: str) -> 'pd.DataFrame':
+    """
+    Extrae transacciones sin balancear (todas), para cálculos de drift / PSI.
+    A diferencia de extract_and_balance_data, NO aplica undersampling.
+
+    Args:
+        start_date: 'YYYY-MM-DD'
+        end_date:   'YYYY-MM-DD'
+
+    Returns:
+        DataFrame con todas las transacciones del período (fraudes + legítimas).
+    """
+    conn = get_db_connection()
+    try:
+        query = """
+            SELECT
+                ot.amt,
+                l.city_pop,
+                c.category_name  AS category,
+                g.gender_description AS gender,
+                cu.job,
+                l.customer_lat   AS lat,
+                l.customer_long  AS long,
+                ot.merch_lat,
+                ot.merch_long,
+                ot.trans_date_time::text AS trans_date_trans_time,
+                cu.dob::text,
+                ot.is_fraud_ground_truth AS is_fraud
+            FROM operational_transactions ot
+            JOIN credit_cards cc  ON ot.cc_num      = cc.cc_num
+            JOIN customer cu      ON cc.id_customer  = cu.id_customer
+            JOIN localization l   ON cu.id_localization = l.id_localization
+            JOIN gender g         ON cu.id_gender    = g.id_gender
+            JOIN categories c     ON ot.id_category  = c.id_category
+            WHERE ot.trans_date_time BETWEEN %s AND %s
+        """
+        cursor = conn.cursor()
+        cursor.execute(query, [start_date, end_date])
+        columns = [desc[0] for desc in cursor.description]
+        rows = cursor.fetchall()
+        cursor.close()
+
+        df = pd.DataFrame(rows, columns=columns)
+
+        # Convertir tipos numéricos
+        for col in ['amt', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'is_fraud']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+
+        logger.info(f"📊 get_raw_transactions: {len(df):,} filas ({start_date} → {end_date})")
+        return df
+
+    except Exception as e:
+        logger.error(f"❌ Error en get_raw_transactions: {e}")
+        raise
+    finally:
+        conn.close()
+
