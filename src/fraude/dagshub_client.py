@@ -89,10 +89,13 @@ def upload_champion(model_bytes: bytes, version_tag: str):
     """
     Sube el nuevo modelo Champion a DagsHub.
     Usa la API REST directa para evitar bugs del SDK (last_commit issue).
+    
+    Returns:
+        tuple: (url_dagshub, size_mb) si exitoso, (None, 0.0) si falla.
     """
     if not DAGSHUB_TOKEN:
         logger.error("[ERROR] No se puede subir Champion: Falta Token")
-        return False
+        return None, 0.0
 
     try:
         repo_fullname = f"{DAGSHUB_REPO_OWNER}/{DAGSHUB_REPO_NAME}"
@@ -140,14 +143,19 @@ def upload_champion(model_bytes: bytes, version_tag: str):
         
         if response.status_code in (200, 201):
             logger.info(f"[OK] Champion actualizado correctamente en DagsHub (HTTP {response.status_code})")
-            return True
+            
+            # Construir URL pública del archivo
+            public_url = f"https://dagshub.com/{DAGSHUB_REPO_OWNER}/{DAGSHUB_REPO_NAME}/src/main/{DAGSHUB_MODEL_PATH}"
+            size_mb = len(model_bytes) / (1024 * 1024)
+            
+            return public_url, size_mb
         else:
             logger.error(f"[ERROR] DagsHub retorno HTTP {response.status_code}: {response.text[:300]}")
-            return False
+            return None, 0.0
         
     except Exception as e:
         logger.error(f"[ERROR] Error subiendo Champion: {e}")
-        return False
+        return None, 0.0
 
 
 def verify_champion_integrity(expected_version: str) -> bool:

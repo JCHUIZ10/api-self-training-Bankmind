@@ -26,7 +26,7 @@ from fraude.fraude_schema import (
 from fraude.data_extraction import extract_and_balance_data, validate_date_range
 from fraude.db_config import get_db_session
 from fraude import model_registry
-from fraude.dagshub_client import get_dagshub_client
+from fraude.dagshub_client import upload_champion
 
 logger = logging.getLogger(__name__)
 
@@ -488,11 +488,9 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
             print("🔍 DEBUG: Subiendo modelo a DagsHub...")
             logger.info("📤 Subiendo modelo a DagsHub...")
             
-            dagshub_client = get_dagshub_client()
-            dagshub_url, model_size_mb = dagshub_client.upload_model(
+            dagshub_url, model_size_mb = upload_champion(
                 model_bytes=model_bytes,
-                model_version=model_version,
-                artifact_path="fraud_models"
+                version_tag=model_version
             )
             
             if dagshub_url:
@@ -577,10 +575,10 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
                 print("🔍 DEBUG: Promoviendo a CHAMPION...")
                 logger.info("🏆 Promoviendo modelo a CHAMPION...")
                 try:
-                    success = model_registry.promote_to_champion(
+                    success = model_registry.promote_model_to_champion(
                         session=session,
                         model_id=model_id,
-                        promotion_reason=promotion_reason or "Promoted based on metrics"
+                        promotion_reason=promotion_reason
                     )
                     if success:
                         session.commit()
