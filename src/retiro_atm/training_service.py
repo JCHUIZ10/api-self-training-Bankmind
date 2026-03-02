@@ -161,7 +161,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
                 ic=ic,
                 margin_improvement=margin_improvement,
                 start_datetime=start_datetime,
-                dataset_id=dataset_record.id,
+                dataset_id=dataset_record.id, # type: ignore
             )
 
             if deployment_status == "NEW_CHAMPION":
