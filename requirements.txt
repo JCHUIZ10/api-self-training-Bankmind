@@ -25,4 +25,5 @@ uvicorn==0.38.0
 xgboost
 lightgbm
 optuna
-shap
+shapdagshub
+mlflow

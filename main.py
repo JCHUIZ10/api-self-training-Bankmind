@@ -17,6 +17,8 @@ logger = logging.getLogger(__name__)
 
 # Importar routers
 from morosidad.router import router as morosidad_router
+from fraude.router import router as fraude_router
+from retiro_atm.router import router as retiro_atm_router
 
 # Crear app FastAPI
 app = FastAPI(
@@ -27,6 +29,8 @@ app = FastAPI(
 
 # Registrar routers
 app.include_router(morosidad_router)
+app.include_router(fraude_router)
+app.include_router(retiro_atm_router)
 
 
 @app.get("/health")
