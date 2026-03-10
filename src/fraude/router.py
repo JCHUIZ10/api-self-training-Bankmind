@@ -10,6 +10,8 @@ from fraude.drift_service import (
     DriftCalculationResponse,
     calculate_drift,
 )
+from fraude.clustering_schema import ClusteringRequest, ClusteringResponse
+from fraude.clustering_service import compute_clusters
 
 logger = logging.getLogger(__name__)
 
@@ -95,4 +97,45 @@ async def calculate_feature_drift(request: DriftCalculationRequest):
         raise HTTPException(
             status_code=500,
             detail="Error calculando drift. Revisa los logs del servidor.",
+        )
+
+
+@router.post("/clustering/compute", response_model=ClusteringResponse)
+async def compute_fraud_clusters(request: ClusteringRequest):
+    """
+    Ejecuta K-Means clustering sobre transacciones ALTO RIESGO.
+
+    Identifica perfiles automáticos de defraudadores agrupando
+    las transacciones fraudulentas por características similares
+    (monto, hora, edad, distancia, ciudad).
+
+    Llamado por el Scheduler de Java semanalmente (Lunes 03:00 AM)
+    o manualmente desde el Dashboard.
+
+    Args:
+        n_clusters:    Número de grupos a identificar (default 3).
+        min_samples:   Mínimo de muestras para ejecutar el análisis (default 30).
+        lookback_days: Si se especifica, limita a los últimos N días.
+
+    Returns:
+        ClusteringResponse con lista de ClusterProfile (perfiles de defraudadores)
+        ordenados de mayor a menor frecuencia.
+    """
+    logger.info(
+        "[CLUSTERING] Solicitud recibida: K=%d, min_samples=%d, lookback=%s",
+        request.n_clusters, request.min_samples, request.lookback_days,
+    )
+    try:
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, compute_clusters, request)
+        logger.info(
+            "[CLUSTERING] Completado: %d clusters, %d fraudes analizados.",
+            response.n_clusters_used, response.total_frauds_analyzed,
+        )
+        return response
+    except Exception as exc:
+        logger.exception("[CLUSTERING ERROR] %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Error ejecutando clustering. Revisa los logs del servidor.",
         )

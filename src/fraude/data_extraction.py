@@ -1,244 +1,337 @@
 # src/fraude/data_extraction.py
 import logging
+import math
+import os
+from datetime import datetime, timedelta
+
 import pandas as pd
-from datetime import datetime
-from typing import List, Dict, Any
 
 from fraude.db_config import get_db_connection
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Constantes por defecto
+# ─────────────────────────────────────────────────────────────────────────────
+DEFAULT_MAX_HISTORY_DAYS = 730   # 2 años
+DEFAULT_HALF_LIFE_DAYS   = 180   # peso 0.5 a los 180 días
+DEFAULT_IF_RECENT_MONTHS = 6     # ventana de IsolationForest
 
-def extract_and_balance_data(
-    start_date: str,
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers de fecha / λ
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_reference_date() -> datetime:
+    """
+    Devuelve la fecha de referencia para el entrenamiento.
+
+    Precedencia:
+      1. Variable de entorno REFERENCE_DATE (YYYY-MM-DD) — útil en desarrollo
+         con datos históricos (ej. dataset de 2019).
+      2. datetime.now() — comportamiento por defecto en producción.
+
+    Así el código no cambia entre entornos; solo varía la configuración.
+    """
+    raw = os.getenv("REFERENCE_DATE", "").strip()
+    if raw:
+        try:
+            ref = datetime.strptime(raw, "%Y-%m-%d")
+            logger.info("📅 REFERENCE_DATE desde entorno: %s", ref.date())
+            return ref
+        except ValueError:
+            logger.warning(
+                "⚠️ REFERENCE_DATE='%s' no es YYYY-MM-DD. Usando datetime.now().", raw
+            )
+    return datetime.now()
+
+
+def compute_lambda(half_life_days: int) -> float:
+    """
+    Calcula λ a partir de la vida media.
+    Fórmula: λ = ln(2) / half_life_days
+    Interpretación: a los `half_life_days` días el peso del dato habrá caído al 50%.
+    """
+    lam = math.log(2) / half_life_days
+    logger.info(
+        "📐 Decay λ=%.6f (half_life=%d días → peso al año=%.1f%%)",
+        lam, half_life_days, 100 * math.exp(-lam * 365),
+    )
+    return lam
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DataProvider — Separación de Responsabilidades (SRP)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DataProvider:
+    """
+    Provee vistas del DataFrame de entrenamiento a los distintos modelos del
+    pipeline híbrido.
+
+    Responsabilidad única: saber qué porción del dataset debe ver cada modelo.
+
+    - XGBoost        → toda la historia con pesos exponenciales (get_full_data).
+    - IsolationForest→ solo los últimos N meses, sin pesos (get_recent_data).
+      Justificación: IF no soporta sample_weight; limitarlo al período reciente
+      garantiza que el anomaly_score refleje los patrones de fraude actuales.
+
+    Nota: el feature engineering se realiza FUERA de esta clase, en
+    training_service.py, para mantener la separación entre extracción y
+    transformación.
+    """
+
+    def __init__(self, df: pd.DataFrame, if_recent_months: int = DEFAULT_IF_RECENT_MONTHS) -> None:
+        if "trans_date_trans_time" not in df.columns:
+            raise ValueError(
+                "DataProvider requiere la columna 'trans_date_trans_time' (datetime) en el DataFrame."
+            )
+        self._df = df
+        self._if_recent_months = if_recent_months
+
+    def get_full_data(self) -> pd.DataFrame:
+        """
+        Devuelve el dataset completo (toda la historia) con pesos exponenciales.
+        Usado por XGBoost para entrenamiento ponderado.
+        """
+        return self._df
+
+    def get_recent_data(self) -> pd.DataFrame:
+        """
+        Devuelve únicamente los datos de los últimos `if_recent_months` meses.
+        Usado por IsolationForest, que no soporta sample_weight.
+        """
+        max_date = self._df["trans_date_trans_time"].max()
+        cutoff   = max_date - pd.DateOffset(months=self._if_recent_months)
+        recent   = self._df[self._df["trans_date_trans_time"] >= cutoff].copy()
+        logger.info(
+            "🌳 DataProvider.get_recent_data(): %d registros (últimos %d meses, corte=%s)",
+            len(recent), self._if_recent_months, cutoff.date(),
+        )
+        return recent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Extracción principal
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_training_data(
     end_date: str,
-    undersampling_ratio: int = 4
+    lam: float,
+    max_history_days: int = DEFAULT_MAX_HISTORY_DAYS,
+    undersampling_ratio: int = 4,
+    start_date: str | None = None,
 ) -> pd.DataFrame:
     """
-    Extrae datos de operational_transactions con sampling balanceado.
-    
-    Estrategia:
-    1. Extrae el 100% de fraudes (clase minoritaria)
-    2. Extrae una muestra aleatoria de transacciones legítimas
-    3. Ratio configurable: por defecto 4 legítimas por cada fraude
-    
+    Extrae datos de `operational_transactions` con decay temporal exponencial
+    calculado directamente en PostgreSQL.
+
+    Estrategia de extracción:
+    ─────────────────────────
+    1. El peso de cada transacción se calcula en la query como:
+           weight = EXP(-λ * days_since_transaction)
+       siendo `end_date` el punto de referencia (peso 1.0 en ese día).
+    2. Fraudes: se extrae el 100% del período (clase minoritaria).
+    3. Legítimas: undersampling count-based (fraud_count × undersampling_ratio).
+       El propio XGBoost aplicará los pesos temporales durante el entrenamiento,
+       por lo que el ratio count-based es suficiente.
+
     Args:
-        start_date: Fecha inicial (formato: 'YYYY-MM-DD')
-        end_date: Fecha final (formato: 'YYYY-MM-DD')
-        undersampling_ratio: Número de legítimas por cada fraude (default: 4)
-    
+        end_date:           Fecha de referencia ('YYYY-MM-DD'). Peso 1.0 en este día.
+        lam:                Lambda del decay (calculado de half_life_days).
+        max_history_days:   Techo de historia en días (solo si start_date is None).
+        undersampling_ratio:Número de legítimas por cada fraude.
+        start_date:         Límite inferior opcional. Si None, se calcula
+                            como end_date - max_history_days.
+
     Returns:
-        DataFrame con datos balanceados
+        DataFrame balanceado con columna `sample_weight` ya calculada.
     """
     conn = get_db_connection()
-    
     try:
-        logger.info(f"📊 Extrayendo datos del {start_date} al {end_date}")
-        
-        # =========================================
-        # 1. EXTRAER TODOS LOS FRAUDES
-        # =========================================
+        # ── Calcular límite inferior ──────────────────────────────────────────
+        end_dt   = datetime.strptime(end_date, "%Y-%m-%d")
+        start_dt = (
+            datetime.strptime(start_date, "%Y-%m-%d")
+            if start_date
+            else end_dt - timedelta(days=max_history_days)
+        )
+        effective_start = start_dt.strftime("%Y-%m-%d")
+        logger.info(
+            "📊 Extrayendo datos del %s al %s (λ=%.6f)",
+            effective_start, end_date, lam,
+        )
+
+        # ── 1. Fraudes (100 %) ────────────────────────────────────────────────
+        # El decay se calcula en SQL para delegar la operación pesada a PostgreSQL.
+        # Fórmula: EXP(-λ * días_desde_transacción_hasta_end_date)
+        # El multiplicador de intervalo `%s * INTERVAL '1 day'` es SQL válido en PG.
         fraud_query = """
-            SELECT 
+            SELECT
                 ot.amt,
                 l.city_pop,
-                c.category_name as category,
-                g.gender_description as gender,
+                c.category_name            AS category,
+                g.gender_description       AS gender,
                 cu.job,
-                l.customer_lat as lat,
-                l.customer_long as long,
+                l.customer_lat             AS lat,
+                l.customer_long            AS long,
                 ot.merch_lat,
                 ot.merch_long,
-                ot.trans_date_time::text as trans_date_trans_time,
+                ot.trans_date_time::text   AS trans_date_trans_time,
                 cu.dob::text,
-                ot.is_fraud_ground_truth as is_fraud,
-                1.0 as sample_weight
+                ot.is_fraud_ground_truth   AS is_fraud,
+                EXP(
+                    -(%s::float)
+                    * DATE_PART('day', %s::timestamp - ot.trans_date_time)
+                )                          AS sample_weight
             FROM operational_transactions ot
-            JOIN credit_cards cc ON ot.cc_num = cc.cc_num
-            JOIN customer cu ON cc.id_customer = cu.id_customer
-            JOIN localization l ON cu.id_localization = l.id_localization
-            JOIN gender g ON cu.id_gender = g.id_gender
-            JOIN categories c ON ot.id_category = c.id_category
+            JOIN credit_cards cc ON ot.cc_num          = cc.cc_num
+            JOIN customer     cu ON cc.id_customer     = cu.id_customer
+            JOIN localization  l ON cu.id_localization = l.id_localization
+            JOIN gender        g ON cu.id_gender       = g.id_gender
+            JOIN categories    c ON ot.id_category     = c.id_category
             WHERE ot.is_fraud_ground_truth = 1
               AND ot.trans_date_time BETWEEN %s AND %s
         """
-        
-        # Ejecutar fraud query usando cursor directamente
+
         cursor = conn.cursor()
-        cursor.execute(fraud_query, [start_date, end_date])
-        columns = [desc[0] for desc in cursor.description]
+        cursor.execute(fraud_query, [lam, end_date, effective_start, end_date])
+        columns    = [desc[0] for desc in cursor.description]
         fraud_rows = cursor.fetchall()
         cursor.close()
-        
-        # Construir DataFrame manualmente
-        df_fraud = pd.DataFrame(fraud_rows, columns=columns)
+
+        df_fraud    = pd.DataFrame(fraud_rows, columns=columns)
         fraud_count = len(df_fraud)
-        
-        logger.info(f"🚨 Fraudes encontrados: {fraud_count}")
-        
+        logger.info("🚨 Fraudes encontrados: %d", fraud_count)
+
         if fraud_count == 0:
-            raise ValueError("No se encontraron fraudes en el rango de fechas especificado")
-        
-        # =========================================
-        # 2. CONTAR TOTAL DE LEGÍTIMAS
-        # =========================================
+            raise ValueError(
+                f"No se encontraron fraudes entre {effective_start} y {end_date}. "
+                "Amplía el rango o verifica la tabla operational_transactions."
+            )
+
+        # ── 2. Contar legítimas disponibles ───────────────────────────────────
         count_query = """
-            SELECT COUNT(*) as total
+            SELECT COUNT(*) AS total
             FROM operational_transactions ot
-            JOIN credit_cards cc ON ot.cc_num = cc.cc_num
-            JOIN customer cu ON cc.id_customer = cu.id_customer
-            JOIN localization l ON cu.id_localization = l.id_localization
-            JOIN gender g ON cu.id_gender = g.id_gender
-            JOIN categories c ON ot.id_category = c.id_category
+            JOIN credit_cards cc ON ot.cc_num          = cc.cc_num
+            JOIN customer     cu ON cc.id_customer     = cu.id_customer
+            JOIN localization  l ON cu.id_localization = l.id_localization
+            JOIN gender        g ON cu.id_gender       = g.id_gender
+            JOIN categories    c ON ot.id_category     = c.id_category
             WHERE ot.is_fraud_ground_truth = 0
               AND ot.trans_date_time BETWEEN %s AND %s
         """
-        
-        
-        # Ejecutar COUNT query usando cursor directamente
         cursor = conn.cursor()
-        cursor.execute(count_query, [start_date, end_date])
-        result_row = cursor.fetchone()
+        cursor.execute(count_query, [effective_start, end_date])
+        result_row      = cursor.fetchone()
         cursor.close()
-        
 
-        
-        # Extraer el valor dependiendo del tipo de resultado
         if isinstance(result_row, dict):
-            total_legitimate = int(result_row['total'])
+            total_legitimate = int(result_row["total"])
         elif isinstance(result_row, (tuple, list)):
             total_legitimate = int(result_row[0])
         else:
-            raise ValueError(f"Tipo inesperado de result_row: {type(result_row)}, contenido: {result_row}")
-        
-        logger.info(f"✅ Legítimas totales disponibles: {total_legitimate:,}")
-        
-        # =========================================
-        # 3. CALCULAR TAMAÑO DE MUESTRA
-        # =========================================
+            raise ValueError(
+                f"Tipo inesperado de result_row: {type(result_row)}, contenido: {result_row}"
+            )
+        logger.info("✅ Legítimas disponibles en el período: %d", total_legitimate)
+
+        # ── 3. Calcular tamaño de muestra ─────────────────────────────────────
         legitimate_sample_size = fraud_count * undersampling_ratio
-        
-        # Verificar que no se pida más de lo disponible
         if legitimate_sample_size > total_legitimate:
-            logger.warning(f"⚠️ Muestra solicitada ({legitimate_sample_size}) > disponible ({total_legitimate}). "
-                          f"Usando todas las legítimas disponibles.")
+            logger.warning(
+                "⚠️ Muestra solicitada (%d) > disponible (%d). Usando todas las legítimas.",
+                legitimate_sample_size, total_legitimate,
+            )
             legitimate_sample_size = total_legitimate
-        
-        logger.info(f"📐 Tomando {legitimate_sample_size:,} legítimas "
-                   f"(ratio {undersampling_ratio}:1)")
-        
-        # =========================================
-        # 4. SAMPLING ALEATORIO DE LEGÍTIMAS
-        # =========================================
+
+        logger.info(
+            "📐 Extrayendo %d legítimas (ratio %d:1 count-based; XGBoost aplica pesos temporales)",
+            legitimate_sample_size, undersampling_ratio,
+        )
+
+        # ── 4. Legítimas con sampling aleatorio y decay en SQL ────────────────
         legitimate_query = """
-            SELECT 
+            SELECT
                 ot.amt,
                 l.city_pop,
-                c.category_name as category,
-                g.gender_description as gender,
+                c.category_name            AS category,
+                g.gender_description       AS gender,
                 cu.job,
-                l.customer_lat as lat,
-                l.customer_long as long,
+                l.customer_lat             AS lat,
+                l.customer_long            AS long,
                 ot.merch_lat,
                 ot.merch_long,
-                ot.trans_date_time::text as trans_date_trans_time,
+                ot.trans_date_time::text   AS trans_date_trans_time,
                 cu.dob::text,
-                ot.is_fraud_ground_truth as is_fraud,
-                1.0 as sample_weight
+                ot.is_fraud_ground_truth   AS is_fraud,
+                EXP(
+                    -(%s::float)
+                    * DATE_PART('day', %s::timestamp - ot.trans_date_time)
+                )                          AS sample_weight
             FROM operational_transactions ot
-            JOIN credit_cards cc ON ot.cc_num = cc.cc_num
-            JOIN customer cu ON cc.id_customer = cu.id_customer
-            JOIN localization l ON cu.id_localization = l.id_localization
-            JOIN gender g ON cu.id_gender = g.id_gender
-            JOIN categories c ON ot.id_category = c.id_category
+            JOIN credit_cards cc ON ot.cc_num          = cc.cc_num
+            JOIN customer     cu ON cc.id_customer     = cu.id_customer
+            JOIN localization  l ON cu.id_localization = l.id_localization
+            JOIN gender        g ON cu.id_gender       = g.id_gender
+            JOIN categories    c ON ot.id_category     = c.id_category
             WHERE ot.is_fraud_ground_truth = 0
               AND ot.trans_date_time BETWEEN %s AND %s
             ORDER BY RANDOM()
             LIMIT %s
         """
-        
-        # Ejecutar legitimate query usando cursor directamente
         cursor = conn.cursor()
-        cursor.execute(legitimate_query, [start_date, end_date, legitimate_sample_size])
-        columns = [desc[0] for desc in cursor.description]
+        cursor.execute(
+            legitimate_query,
+            [lam, end_date, effective_start, end_date, legitimate_sample_size],
+        )
+        columns         = [desc[0] for desc in cursor.description]
         legitimate_rows = cursor.fetchall()
         cursor.close()
-        
-        # Construir DataFrame manualmente
+
         df_legitimate = pd.DataFrame(legitimate_rows, columns=columns)
-        
-        logger.info(f"✅ Legítimas extraídas: {len(df_legitimate):,}")
-        
-        # =========================================
-        # 5. COMBINAR Y MEZCLAR
-        # =========================================
+        logger.info("✅ Legítimas extraídas: %d", len(df_legitimate))
+
+        # ── 5. Combinar, convertir tipos y mezclar ────────────────────────────
         df_combined = pd.concat([df_fraud, df_legitimate], ignore_index=True)
-        
-        # IMPORTANTE: Convertir tipos de datos
-        # Cuando se crea DataFrame desde cursor, todas las columnas son 'object' (string)
-        # Necesitamos convertir explícitamente las numéricas
-        numeric_cols = ['amt', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 
-                       'is_fraud', 'sample_weight']
-        
+
+        numeric_cols = ["amt", "city_pop", "lat", "long", "merch_lat", "merch_long",
+                        "is_fraud", "sample_weight"]
         for col in numeric_cols:
             if col in df_combined.columns:
-                df_combined[col] = pd.to_numeric(df_combined[col], errors='coerce')
-        
-        logger.info(f"✅ Tipos de datos convertidos correctamente")
-        
-        # Mezclar aleatoriamente
+                df_combined[col] = pd.to_numeric(df_combined[col], errors="coerce")
+
         df_combined = df_combined.sample(frac=1, random_state=42).reset_index(drop=True)
-        
-        # Calcular estadísticas finales
-        final_fraud_ratio = len(df_fraud) / len(df_combined)
-        
-        logger.info(f"📊 Dataset balanceado creado:")
-        logger.info(f"   - Total samples: {len(df_combined):,}")
-        logger.info(f"   - Fraudes: {len(df_fraud):,} ({final_fraud_ratio:.1%})")
-        logger.info(f"   - Legítimas: {len(df_legitimate):,} ({1-final_fraud_ratio:.1%})")
-        logger.info(f"   - Ratio final: {len(df_legitimate)/len(df_fraud):.2f}:1")
-        
+
+        # ── 6. Log de pesos para verificación ────────────────────────────────
+        weights      = df_combined["sample_weight"]
+        fraud_ratio  = len(df_fraud) / len(df_combined)
+        logger.info("📊 Dataset balanceado con decay temporal:")
+        logger.info("   - Total samples    : %d", len(df_combined))
+        logger.info("   - Fraudes          : %d (%.1f%%)", len(df_fraud), fraud_ratio * 100)
+        logger.info("   - Legítimas        : %d (%.1f%%)", len(df_legitimate), (1 - fraud_ratio) * 100)
+        logger.info("   - sample_weight min: %.4f", weights.min())
+        logger.info("   - sample_weight mean: %.4f", weights.mean())
+        logger.info("   - sample_weight max: %.4f", weights.max())
+        logger.info("   - Rango efectivo   : %s → %s", effective_start, end_date)
+
         return df_combined
-        
-    except Exception as e:
-        logger.error(f"❌ Error extrayendo datos: {e}")
+
+    except Exception:
+        logger.exception("❌ Error extrayendo datos de entrenamiento")
         raise
     finally:
         conn.close()
 
 
-def validate_date_range(start_date: str, end_date: str):
-    """
-    Valida que el rango de fechas sea correcto.
-    """
-    try:
-        start = datetime.strptime(start_date, '%Y-%m-%d')
-        end = datetime.strptime(end_date, '%Y-%m-%d')
-        
-        if start >= end:
-            raise ValueError("start_date debe ser anterior a end_date")
-        
-        # Validar que el rango no sea muy pequeño (al menos 1 mes)
-        delta_days = (end - start).days
-        if delta_days < 30:
-            logger.warning(f"⚠️ Rango de fechas muy corto: {delta_days} días. "
-                          f"Recomendado: al menos 90 días para tener suficientes fraudes.")
-        
-        # Validar que el rango no sea muy grande (máximo 6 meses)
-        if delta_days > 180:
-            logger.warning(f"⚠️ Rango de fechas muy amplio: {delta_days} días. "
-                          f"Esto puede generar un dataset muy grande.")
-        
-        logger.info(f"📅 Rango de fechas validado: {delta_days} días")
-        
-    except ValueError as e:
-        raise ValueError(f"Formato de fecha inválido. Use 'YYYY-MM-DD'. Error: {e}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Extracción sin balancear (PSI / drift)
+# ─────────────────────────────────────────────────────────────────────────────
 
-
-def get_raw_transactions(start_date: str, end_date: str) -> 'pd.DataFrame':
+def get_raw_transactions(start_date: str, end_date: str) -> pd.DataFrame:
     """
     Extrae transacciones sin balancear (todas), para cálculos de drift / PSI.
-    A diferencia de extract_and_balance_data, NO aplica undersampling.
+    A diferencia de extract_training_data, NO aplica undersampling ni decay.
 
     Args:
         start_date: 'YYYY-MM-DD'
@@ -264,32 +357,66 @@ def get_raw_transactions(start_date: str, end_date: str) -> 'pd.DataFrame':
                 cu.dob::text,
                 ot.is_fraud_ground_truth AS is_fraud
             FROM operational_transactions ot
-            JOIN credit_cards cc  ON ot.cc_num      = cc.cc_num
-            JOIN customer cu      ON cc.id_customer  = cu.id_customer
-            JOIN localization l   ON cu.id_localization = l.id_localization
-            JOIN gender g         ON cu.id_gender    = g.id_gender
-            JOIN categories c     ON ot.id_category  = c.id_category
+            JOIN credit_cards cc  ON ot.cc_num        = cc.cc_num
+            JOIN customer     cu  ON cc.id_customer   = cu.id_customer
+            JOIN localization  l  ON cu.id_localization = l.id_localization
+            JOIN gender        g  ON cu.id_gender     = g.id_gender
+            JOIN categories    c  ON ot.id_category   = c.id_category
             WHERE ot.trans_date_time BETWEEN %s AND %s
         """
         cursor = conn.cursor()
         cursor.execute(query, [start_date, end_date])
         columns = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
+        rows    = cursor.fetchall()
         cursor.close()
 
         df = pd.DataFrame(rows, columns=columns)
 
-        # Convertir tipos numéricos
-        for col in ['amt', 'city_pop', 'lat', 'long', 'merch_lat', 'merch_long', 'is_fraud']:
+        for col in ["amt", "city_pop", "lat", "long", "merch_lat", "merch_long", "is_fraud"]:
             if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        logger.info(f"📊 get_raw_transactions: {len(df):,} filas ({start_date} → {end_date})")
+        logger.info("📊 get_raw_transactions: %d filas (%s → %s)", len(df), start_date, end_date)
         return df
 
-    except Exception as e:
-        logger.error(f"❌ Error en get_raw_transactions: {e}")
+    except Exception:
+        logger.exception("❌ Error en get_raw_transactions")
         raise
     finally:
         conn.close()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validación de fechas
+# ─────────────────────────────────────────────────────────────────────────────
+
+def validate_training_dates(end_date: str, start_date: str | None = None) -> None:
+    """
+    Valida que las fechas de entrenamiento sean correctas.
+
+    Args:
+        end_date:   Fecha de referencia (requerida).
+        start_date: Límite inferior opcional.
+    """
+    try:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    except ValueError as e:
+        raise ValueError(f"end_date inválido. Use 'YYYY-MM-DD'. Error: {e}")
+
+    if start_date:
+        try:
+            start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        except ValueError as e:
+            raise ValueError(f"start_date inválido. Use 'YYYY-MM-DD'. Error: {e}")
+
+        if start_dt >= end_dt:
+            raise ValueError("start_date debe ser anterior a end_date.")
+
+        delta_days = (end_dt - start_dt).days
+        if delta_days < 30:
+            logger.warning(
+                "⚠️ Rango de fechas muy corto (%d días). Recomendado: mínimo 90 días.", delta_days
+            )
+        logger.info("📅 Rango validado: %d días (%s → %s)", delta_days, start_date, end_date)
+    else:
+        logger.info("📅 end_date validado: %s (start_date se calculará automáticamente)", end_date)

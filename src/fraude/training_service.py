@@ -1,6 +1,7 @@
 # src/fraude/training_service.py
 import io
 import logging
+import math
 import time
 from datetime import datetime
 
@@ -24,7 +25,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, RobustScaler
 from xgboost import XGBClassifier
 
-from fraude.data_extraction import extract_and_balance_data, validate_date_range
+from fraude.data_extraction import (
+    DataProvider,
+    compute_lambda,
+    extract_training_data,
+    get_reference_date,
+    validate_training_dates,
+)
 from fraude.db_config import get_db_session
 from fraude.fraude_schema import (
     OptunaResult,
@@ -44,12 +51,12 @@ CATEGORICAL_COLS = ["category", "gender", "job"]
 COLS_TO_SCALE = ["amt", "city_pop", "age", "distance_km", "hour"]
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Utilidades de feature engineering
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def haversine_np(lon1, lat1, lon2, lat2):
-    """Calcula distancia en km entre dos puntos geográficos usando fórmula Haversine."""
+    """Calcula distancia en km entre dos puntos geográficos (fórmula Haversine)."""
     lon1, lat1, lon2, lat2 = map(np.radians, [lon1, lat1, lon2, lat2])
     dlon = lon2 - lon1
     dlat = lat2 - lat1
@@ -57,91 +64,181 @@ def haversine_np(lon1, lat1, lon2, lat2):
     return 6371 * 2 * np.arcsin(np.sqrt(a))
 
 
-# ---------------------------------------------------------------------------
+def apply_feature_engineering(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aplica feature engineering sobre un DataFrame extraído de la BD.
+    Devuelve el mismo DataFrame con columnas adicionales: age, hour, distance_km.
+    La columna trans_date_trans_time se convierte a datetime in-place.
+    """
+    df = df.copy()
+    df["trans_date_trans_time"] = pd.to_datetime(df["trans_date_trans_time"])
+    df["dob"]                   = pd.to_datetime(df["dob"])
+    df["age"]         = df.apply(
+        lambda r: relativedelta(r["trans_date_trans_time"], r["dob"]).years, axis=1
+    )
+    df["hour"]        = df["trans_date_trans_time"].dt.hour
+    df["distance_km"] = haversine_np(df["long"], df["lat"], df["merch_long"], df["merch_lat"])
+    return df
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# XGBObjective — Callable para Optuna con sample_weight
+# ─────────────────────────────────────────────────────────────────────────────
+
+class XGBObjective:
+    """
+    Función objetivo inyectable para Optuna.
+
+    Encapsula los datos de entrenamiento/test y los pesos temporales, de modo
+    que Optuna optimiza hiperparámetros ponderando correctamente los datos
+    históricos (datos viejos valen menos que datos recientes).
+
+    Maximiza F1-Score sobre el conjunto de test.
+    """
+
+    def __init__(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        y_test: pd.Series,
+        w_train: np.ndarray,
+    ) -> None:
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_test  = X_test
+        self.y_test  = y_test
+        self.w_train = w_train
+
+    def __call__(self, trial: optuna.Trial) -> float:
+        param = {
+            "n_estimators":     trial.suggest_int("n_estimators", 100, 300),
+            "max_depth":        trial.suggest_int("max_depth", 4, 8),
+            "learning_rate":    trial.suggest_float("learning_rate", 0.05, 0.2),
+            "scale_pos_weight": trial.suggest_float("scale_pos_weight", 15, 35),
+            "subsample":        trial.suggest_float("subsample", 0.7, 1.0),
+            "random_state":     42,
+            "eval_metric":      "logloss",
+        }
+        model = XGBClassifier(**param)
+        # Los pesos temporales se pasan a fit para que Optuna elija
+        # hiperparámetros que priorizan los datos más recientes.
+        model.fit(self.X_train, self.y_train, sample_weight=self.w_train)
+        preds = model.predict(self.X_test)
+        return f1_score(self.y_test, preds)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Pipeline principal
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
     """
-    Pipeline completo de entrenamiento híbrido para fraude.
+    Pipeline completo de entrenamiento híbrido para fraude con decay temporal.
 
-    Extrae datos automáticamente de la base de datos.
-
-    Pipeline:
-    1.  Validar fechas
-    2.  Extraer + balance sampling desde BD
-    3.  Feature engineering
-    4.  Encoding y scaling
-    5.  IsolationForest (anomaly_score)
-    6.  Optuna optimization
-    7.  XGBoost final
-    8.  Threshold optimization
-    9.  Métricas
-    10. SHAP explainer
-    11. Serialización
-    12. Comparación con champion
-    13. Baseline PSI distributions
-    14. Persistencia en BD (separada de la comparación)
-    15. Promoción a CHAMPION (si aplica)
+    Flujo:
+     1.  Resolver fechas de referencia (env var REFERENCE_DATE o now())
+     2.  Calcular λ desde half_life_days
+     3.  Validar fechas
+     4.  Extraer datos con decay exponencial calculado en SQL
+     5.  Feature engineering (age, hour, distance_km)
+     6.  DataProvider: vistas por modelo (full para XGB, reciente para IF)
+     7.  Encoding de categóricas
+     8.  Split train/test (estratificado)
+     9.  Scaling (RobustScaler)
+    10.  IsolationForest — entrenado solo con datos recientes (últimos N meses)
+    11.  Optuna con XGBObjective (pasa sample_weight → hiperparámetros correctos)
+    12.  XGBoost final con sample_weight
+    13.  Threshold optimization (Recall >= 95%)
+    14.  Métricas finales
+    15.  SHAP explainer
+    16.  Serialización del modelo híbrido
+    17.  Comparación champion vs challenger
+    18.  Baseline PSI distributions
+    19.  Persistencia en BD
+    20.  Upload a DagsHub
+    21.  Promoción a CHAMPION (si aplica)
     """
     start_time = time.time()
-    logger.info("🚀 Iniciando autoentrenamiento de fraude")
-    logger.info("   Fechas: %s → %s", request.start_date, request.end_date)
-    logger.info("   Optuna trials: %s", request.optuna_trials)
-    logger.info("   Undersampling ratio: %s:1", request.undersampling_ratio)
+    logger.info("🚀 Iniciando autoentrenamiento de fraude con decay temporal")
 
     # =========================================================================
-    # 1. VALIDAR FECHAS
+    # 1. RESOLVER FECHAS DE REFERENCIA
     # =========================================================================
-    validate_date_range(request.start_date, request.end_date)
+    reference_dt = get_reference_date()
+    end_date     = request.end_date or reference_dt.strftime("%Y-%m-%d")
+    start_date   = request.start_date  # puede ser None → se calcula en extract
+
+    logger.info("   Fecha de referencia (end_date): %s", end_date)
+    logger.info("   start_date explícito           : %s", start_date or "None (automático)")
+    logger.info("   max_history_days               : %d días", request.max_history_days)
+    logger.info("   half_life_days                 : %d días", request.half_life_days)
+    logger.info("   if_recent_months               : %d meses (IsolationForest)", request.if_recent_months)
+    logger.info("   Optuna trials                  : %d", request.optuna_trials)
+    logger.info("   Undersampling ratio            : %d:1", request.undersampling_ratio)
 
     # =========================================================================
-    # 2. EXTRAER DATOS DE BD CON SAMPLING BALANCEADO
+    # 2. CALCULAR λ DESDE HALF_LIFE_DAYS
     # =========================================================================
-    df = extract_and_balance_data(
-        start_date=request.start_date,
-        end_date=request.end_date,
-        undersampling_ratio=request.undersampling_ratio,
+    lam = compute_lambda(request.half_life_days)
+
+    # =========================================================================
+    # 3. VALIDAR FECHAS
+    # =========================================================================
+    validate_training_dates(end_date=end_date, start_date=start_date)
+
+    # =========================================================================
+    # 4. EXTRAER DATOS CON DECAY EXPONENCIAL EN SQL
+    # =========================================================================
+    df_raw = extract_training_data(
+        end_date          = end_date,
+        lam               = lam,
+        max_history_days  = request.max_history_days,
+        undersampling_ratio = request.undersampling_ratio,
+        start_date        = start_date,
     )
 
-    fraud_count_original = len(df[df["is_fraud"] == 1])
-    fraud_ratio_original = fraud_count_original / len(df)
-
-    logger.info("📊 Datos extraídos: %d transacciones", len(df))
+    fraud_count_original = int((df_raw["is_fraud"] == 1).sum())
+    fraud_ratio_original = fraud_count_original / len(df_raw)
+    logger.info("📊 Datos extraídos: %d transacciones", len(df_raw))
     logger.info("   Fraudes: %d (%.1f%%)", fraud_count_original, fraud_ratio_original * 100)
 
     # =========================================================================
-    # 3. FEATURE ENGINEERING
+    # 5. FEATURE ENGINEERING (sobre todo el dataset)
     # =========================================================================
     logger.info("📐 Aplicando feature engineering...")
+    df = apply_feature_engineering(df_raw)
 
-    df["trans_date_trans_time"] = pd.to_datetime(df["trans_date_trans_time"])
-    df["dob"] = pd.to_datetime(df["dob"])
+    # =========================================================================
+    # 6. DATAPROVIDER — separación de responsabilidades
+    # =========================================================================
+    provider = DataProvider(df, if_recent_months=request.if_recent_months)
 
-    # relativedelta calcula años exactos considerando bisiestos
-    df["age"] = df.apply(
-        lambda r: relativedelta(r["trans_date_trans_time"], r["dob"]).years, axis=1
-    )
-    df["hour"] = df["trans_date_trans_time"].dt.hour
-    df["distance_km"] = haversine_np(df["long"], df["lat"], df["merch_long"], df["merch_lat"])
+    # Dataset completo para XGBoost (todas las épocas con pesos)
+    df_full   = provider.get_full_data()
+    # Dataset reciente para IsolationForest (sin pesos, contexto actual)
+    df_recent = provider.get_recent_data()
+    logger.info("   DataProvider full  : %d registros", len(df_full))
+    logger.info("   DataProvider recent: %d registros (IF)", len(df_recent))
 
+    # =========================================================================
+    # 7. PREPARAR FEATURES / LABELS / PESOS
+    # =========================================================================
     feature_cols = ["amt", "city_pop", "category", "gender", "job", "age", "hour", "distance_km"]
 
-    X = df[feature_cols].copy()
-    y = df["is_fraud"].copy()
-    weights = df["sample_weight"].values
+    X       = df_full[feature_cols].copy()
+    y       = df_full["is_fraud"].copy()
+    weights = df_full["sample_weight"].values
 
-    class_dist = {str(k): int(v) for k, v in y.value_counts().to_dict().items()}
+    class_dist         = {str(k): int(v) for k, v in y.value_counts().to_dict().items()}
     fraud_ratio_balanced = class_dist.get("1", 0) / len(y)
-
     logger.info("📊 Distribución de clases: %s", class_dist)
     logger.info("   Ratio de fraude balanceado: %.1f%%", fraud_ratio_balanced * 100)
 
     # =========================================================================
-    # 4. ENCODING DE CATEGÓRICAS
+    # 8. ENCODING DE CATEGÓRICAS
     # =========================================================================
     logger.info("🔤 Encoding de variables categóricas...")
-
     encoders_dict = {}
     for col in CATEGORICAL_COLS:
         le = LabelEncoder()
@@ -149,127 +246,133 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
         X[col] = le.transform(X[col].astype(str))
         encoders_dict[col] = le
 
+    # Aplicar el mismo encoding al subset reciente para IF
+    X_recent = df_recent[feature_cols].copy()
+    for col in CATEGORICAL_COLS:
+        le = encoders_dict[col]
+        # Valores no vistos se reemplazan por la primera clase conocida (fallback seguro)
+        X_recent[col] = X_recent[col].astype(str).apply(
+            lambda v: v if v in le.classes_ else le.classes_[0]
+        )
+        X_recent[col] = le.transform(X_recent[col])
+
     # =========================================================================
-    # 5. SPLIT TRAIN/TEST
+    # 9. SPLIT TRAIN / TEST (estratificado)
     # =========================================================================
     X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
         X, y, weights, test_size=0.2, random_state=42, stratify=y
     )
     logger.info("📂 Train: %d | Test: %d", len(X_train), len(X_test))
+    logger.info(
+        "   sample_weight train — min=%.4f, mean=%.4f, max=%.4f",
+        w_train.min(), w_train.mean(), w_train.max(),
+    )
 
     # =========================================================================
-    # 6. SCALING
+    # 10. SCALING
     # =========================================================================
     logger.info("⚖️ Aplicando scaling con RobustScaler...")
-
     scaler = RobustScaler()
-    X_train[COLS_TO_SCALE] = scaler.fit_transform(X_train[COLS_TO_SCALE])
-    X_test[COLS_TO_SCALE] = scaler.transform(X_test[COLS_TO_SCALE])
+    X_train[COLS_TO_SCALE]  = scaler.fit_transform(X_train[COLS_TO_SCALE])
+    X_test[COLS_TO_SCALE]   = scaler.transform(X_test[COLS_TO_SCALE])
+
+    # Escalar también el subset reciente para IF
+    X_recent_scaled = X_recent.copy()
+    X_recent_scaled[COLS_TO_SCALE] = scaler.transform(X_recent[COLS_TO_SCALE])
 
     # =========================================================================
-    # 7. ISOLATION FOREST (Detector de Anomalías)
+    # 11. ISOLATION FOREST — solo datos recientes
     # =========================================================================
-    logger.info("🌳 Entrenando Isolation Forest (contamination=0.005)...")
-
+    logger.info(
+        "🌳 Entrenando Isolation Forest con %d registros (últimos %d meses)...",
+        len(X_recent_scaled), request.if_recent_months,
+    )
     if_model = IsolationForest(contamination=0.005, random_state=42, n_jobs=-1)
-    if_model.fit(X_train)
+    if_model.fit(X_recent_scaled)
 
+    # Generar anomaly_score para train y test usando el IF entrenado en datos recientes
     X_train["anomaly_score"] = if_model.decision_function(X_train)
-    X_test["anomaly_score"] = if_model.decision_function(X_test)
-
-    logger.info("✅ Anomaly scores generados")
+    X_test["anomaly_score"]  = if_model.decision_function(X_test)
+    logger.info("✅ Anomaly scores generados (IF entrenado en contexto actual)")
 
     # =========================================================================
-    # 8. OPTIMIZAR XGBOOST CON OPTUNA
+    # 12. OPTIMIZACIÓN OPTUNA CON SAMPLE_WEIGHT
     # =========================================================================
-    logger.info("🔍 Iniciando optimización Optuna (%d trials)...", request.optuna_trials)
-
+    logger.info(
+        "🔍 Iniciando optimización Optuna (%d trials) con sample_weight...",
+        request.optuna_trials,
+    )
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    def objective(trial):
-        """Función objetivo: maximiza F1-Score"""
-        param = {
-            "n_estimators": trial.suggest_int("n_estimators", 100, 300),
-            "max_depth": trial.suggest_int("max_depth", 4, 8),
-            "learning_rate": trial.suggest_float("learning_rate", 0.05, 0.2),
-            "scale_pos_weight": trial.suggest_float("scale_pos_weight", 15, 35),
-            "subsample": trial.suggest_float("subsample", 0.7, 1.0),
-            "random_state": 42,
-            "eval_metric": "logloss",
-            # use_label_encoder eliminado: parámetro obsoleto desde XGBoost 1.6
-        }
-        model = XGBClassifier(**param)
-        model.fit(X_train, y_train)
-        preds = model.predict(X_test)
-        return f1_score(y_test, preds)
-
+    objective = XGBObjective(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        w_train=w_train,
+    )
     study = optuna.create_study(direction="maximize")
     study.optimize(objective, n_trials=request.optuna_trials)
 
-    best_f1 = study.best_value
+    best_f1     = study.best_value
     best_params = study.best_params
     logger.info("✅ Mejor trial: F1-Score = %.4f", best_f1)
 
     # =========================================================================
-    # 9. ENTRENAR XGBOOST FINAL CON MEJORES PARÁMETROS
+    # 13. ENTRENAR XGBOOST FINAL CON MEJORES PARÁMETROS + SAMPLE_WEIGHT
     # =========================================================================
-    logger.info("🚀 Entrenando XGBoost final con los mejores parámetros...")
-
+    logger.info("🚀 Entrenando XGBoost final con parámetros óptimos y sample_weight (%d muestras)...", len(X_train))
     xgb_model = XGBClassifier(
         **best_params,
         eval_metric="logloss",
         random_state=42,
         n_jobs=-1,
-        # use_label_encoder eliminado: parámetro obsoleto desde XGBoost 1.6
     )
-    xgb_model.fit(X_train, y_train)
-    logger.info("✅ XGBoost entrenado con parámetros óptimos")
+    xgb_model.fit(X_train, y_train, sample_weight=w_train)
+    logger.info("✅ XGBoost entrenado con pesos temporales")
 
     # =========================================================================
-    # 10. OPTIMIZACIÓN DE THRESHOLD
+    # 14. OPTIMIZACIÓN DE THRESHOLD (Recall >= 95%)
     # =========================================================================
     logger.info("🎯 Calculando threshold óptimo (Recall >= 95%)...")
-
     y_prob = xgb_model.predict_proba(X_test)[:, 1]
     precisions, recalls, thresholds = precision_recall_curve(y_test, y_prob)
 
-    target_recall = 0.95
-    valid_indices = np.where(recalls >= target_recall)[0]
+    target_recall  = 0.95
+    valid_indices  = np.where(recalls >= target_recall)[0]
 
     if len(valid_indices) > 0:
-        best_idx = valid_indices[np.argmax(precisions[valid_indices])]
+        best_idx       = valid_indices[np.argmax(precisions[valid_indices])]
         best_threshold = thresholds[best_idx]
         best_precision = precisions[best_idx]
-        best_recall = recalls[best_idx]
+        best_recall    = recalls[best_idx]
     else:
         best_threshold = 0.5
         best_precision = precision_score(y_test, (y_prob >= 0.5).astype(int), zero_division=0)
-        best_recall = recall_score(y_test, (y_prob >= 0.5).astype(int), zero_division=0)
+        best_recall    = recall_score(y_test, (y_prob >= 0.5).astype(int), zero_division=0)
 
     logger.info("🎯 Threshold óptimo: %.4f", best_threshold)
-    logger.info("   Recall esperado: %.4f", best_recall)
+    logger.info("   Recall esperado  : %.4f", best_recall)
     logger.info("   Precision esperada: %.4f", best_precision)
 
     y_pred_optimizado = (y_prob >= best_threshold).astype(int)
 
     # =========================================================================
-    # 11. CALCULAR MÉTRICAS
+    # 15. MÉTRICAS FINALES
     # =========================================================================
     logger.info("📏 Calculando métricas finales...")
-
-    auc_roc = roc_auc_score(y_test, y_prob, sample_weight=w_test)
+    auc_roc       = roc_auc_score(y_test, y_prob, sample_weight=w_test)
     training_time = time.time() - start_time
 
     metrics = TrainingMetrics(
-        auc_roc=round(auc_roc, 4),
-        accuracy=round(accuracy_score(y_test, y_pred_optimizado, sample_weight=w_test), 4),
-        precision=round(precision_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
-        recall=round(recall_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
-        f1_score=round(f1_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
-        optimal_threshold=round(best_threshold, 4),
-        training_time_sec=round(training_time, 2),
+        auc_roc           = round(auc_roc, 4),
+        accuracy          = round(accuracy_score(y_test, y_pred_optimizado, sample_weight=w_test), 4),
+        precision         = round(precision_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
+        recall            = round(recall_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
+        f1_score          = round(f1_score(y_test, y_pred_optimizado, sample_weight=w_test, zero_division=0), 4),
+        optimal_threshold = round(best_threshold, 4),
+        training_time_sec = round(training_time, 2),
     )
-
     logger.info(
         "📊 Métricas: AUC=%.4f | F1=%.4f | Recall=%.4f | Precision=%.4f",
         metrics.auc_roc, metrics.f1_score, metrics.recall, metrics.precision,
@@ -277,10 +380,9 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
     logger.info("\n--- Reporte de Clasificación ---\n%s", classification_report(y_test, y_pred_optimizado))
 
     # =========================================================================
-    # 12. CREAR SHAP EXPLAINER
+    # 16. SHAP EXPLAINER
     # =========================================================================
     logger.info("🔬 Creando SHAP explainer...")
-
     try:
         explainer = shap.TreeExplainer(xgb_model)
         logger.info("✅ SHAP explainer creado correctamente")
@@ -289,34 +391,30 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
         explainer = None
 
     # =========================================================================
-    # 13. SERIALIZAR MODELO HÍBRIDO
+    # 17. SERIALIZAR MODELO HÍBRIDO
     # =========================================================================
     logger.info("📦 Serializando modelo híbrido...")
-
     model_package = {
-        "scaler": scaler,
+        "scaler":    scaler,
         "model_xgb": xgb_model,
-        "model_if": if_model,
-        "encoders": encoders_dict,
+        "model_if":  if_model,
+        "encoders":  encoders_dict,
         "explainer": explainer,
     }
-
-    buffer = io.BytesIO()
+    buffer         = io.BytesIO()
     joblib.dump(model_package, buffer)
-    # Extraer bytes inmediatamente para no depender del estado del buffer más tarde
     raw_model_bytes = buffer.getvalue()
-    model_bytes = __import__("base64").b64encode(raw_model_bytes).decode("utf-8")
+    model_bytes     = __import__("base64").b64encode(raw_model_bytes).decode("utf-8")
     logger.info("📦 Modelo serializado: %d caracteres base64", len(model_bytes))
 
     # =========================================================================
-    # 14. COMPARAR CON CHAMPION ACTUAL
+    # 18. COMPARAR CON CHAMPION ACTUAL
     # =========================================================================
     logger.info("🏆 Comparando con modelo CHAMPION actual...")
-
-    champion_metrics = None
+    champion_metrics  = None
     id_champion_model = None
-    promotion_reason = None
-    promotion_status = "PENDING"
+    promotion_reason  = None
+    promotion_status  = "PENDING"
 
     try:
         with get_db_session() as session:
@@ -324,21 +422,22 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
 
             if champion:
                 logger.info("   Champion encontrado: %s", champion.model_version)
-
-                champion_audit = session.query(model_registry.SelfTrainingAuditFraud).filter(
-                    model_registry.SelfTrainingAuditFraud.id_model == champion.id_model
-                ).order_by(model_registry.SelfTrainingAuditFraud.start_training.desc()).first()
-
+                champion_audit = (
+                    session.query(model_registry.SelfTrainingAuditFraud)
+                    .filter(model_registry.SelfTrainingAuditFraud.id_model == champion.id_model)
+                    .order_by(model_registry.SelfTrainingAuditFraud.start_training.desc())
+                    .first()
+                )
                 if champion_audit:
                     champion_metrics = {
-                        "f1_score": float(champion_audit.f1_score) if champion_audit.f1_score else 0.0,
-                        "recall": float(champion_audit.recall_score) if champion_audit.recall_score else 0.0,
-                        "auc_roc": float(champion_audit.auc_roc) if champion_audit.auc_roc else 0.0,
+                        "f1_score": float(champion_audit.f1_score)      if champion_audit.f1_score      else 0.0,
+                        "recall":   float(champion_audit.recall_score)  if champion_audit.recall_score  else 0.0,
+                        "auc_roc":  float(champion_audit.auc_roc)       if champion_audit.auc_roc       else 0.0,
                     }
                     id_champion_model = champion.id_model
 
-                    f1_diff = metrics.f1_score - champion_metrics["f1_score"]
-                    recall_diff = metrics.recall - champion_metrics["recall"]
+                    f1_diff     = metrics.f1_score - champion_metrics["f1_score"]
+                    recall_diff = metrics.recall   - champion_metrics["recall"]
 
                     logger.info("   Champion F1=%.4f | Challenger F1=%.4f", champion_metrics["f1_score"], metrics.f1_score)
                     logger.info("   Champion Recall=%.4f | Challenger Recall=%.4f", champion_metrics["recall"], metrics.recall)
@@ -372,10 +471,9 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
     logger.info("📊 Decisión final: %s — %s", promotion_status, promotion_reason)
 
     # =========================================================================
-    # 15. BASELINE DISTRIBUTIONS (para PSI Drift)
+    # 19. BASELINE DISTRIBUTIONS (para PSI Drift)
     # =========================================================================
     logger.info("📐 Calculando baseline_distributions para PSI drift...")
-
     baseline_distributions = {}
     NUMERIC_FEATURES_FOR_PSI = ["amt", "city_pop", "age", "distance_km", "hour"]
     PERCENTILES = list(range(10, 100, 10))
@@ -389,13 +487,13 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
             if len(values) == 0:
                 continue
             pct_edges = np.percentile(values, PERCENTILES).tolist()
-            bins = [float(values.min())] + pct_edges + [float(values.max())]
+            bins      = [float(values.min())] + pct_edges + [float(values.max())]
             counts, _ = np.histogram(values, bins=np.unique(bins))
-            total = counts.sum()
-            pct = (counts / total * 100.0).tolist() if total > 0 else [0.0] * len(counts)
+            total     = counts.sum()
+            pct       = (counts / total * 100.0).tolist() if total > 0 else [0.0] * len(counts)
             baseline_distributions[feat] = {
-                "bins": [round(b, 6) for b in np.unique(bins).tolist()],
-                "pct": [round(p, 6) for p in pct],
+                "bins":      [round(b, 6) for b in np.unique(bins).tolist()],
+                "pct":       [round(p, 6) for p in pct],
                 "n_samples": int(total),
             }
             logger.info("   ✅ Baseline '%s': %d bins, N=%d", feat, len(pct), total)
@@ -404,134 +502,144 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
 
     logger.info("📐 Baseline calculado para %d features", len(baseline_distributions))
 
-    model_config = {
-        "architecture": "XGBoost + IsolationForest (Hybrid)",
-        "strategy": "IF generates anomaly_score as feature for XGBoost",
-        "xgboost_params": best_params,
-        "isolation_forest_params": {"contamination": 0.005, "random_state": 42},
-        "features_input": feature_cols,
-        "features_derived": ["age", "hour", "distance_km", "anomaly_score"],
-        "categorical_encoded": CATEGORICAL_COLS,
-        "scaled_features": COLS_TO_SCALE,
-        "optimal_threshold": float(best_threshold),
-        "undersampling_ratio": request.undersampling_ratio,
-        "date_range": f"{request.start_date} to {request.end_date}",
+    # Rango efectivo de fechas (extraído del propio DataFrame para trazabilidad)
+    ts_min = df["trans_date_trans_time"].min()
+    ts_max = df["trans_date_trans_time"].max()
+    effective_date_range = f"{ts_min.date()} → {ts_max.date()}"
+
+    model_version = f"fraud_v1.0_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    model_config  = {
+        "architecture":          "XGBoost + IsolationForest (Hybrid)",
+        "strategy":              "IF genera anomaly_score como feature para XGBoost",
+        "xgboost_params":        best_params,
+        "isolation_forest_params": {
+            "contamination":  0.005,
+            "random_state":   42,
+            "training_window": f"últimos {request.if_recent_months} meses (datos recientes)"
+        },
+        "temporal_decay": {
+            "half_life_days":  request.half_life_days,
+            "lambda":          round(lam, 6),
+            "weight_at_1year": round(math.exp(-lam * 365), 4),
+        },
+        "features_input":        feature_cols,
+        "features_derived":      ["age", "hour", "distance_km", "anomaly_score"],
+        "categorical_encoded":   CATEGORICAL_COLS,
+        "scaled_features":       COLS_TO_SCALE,
+        "optimal_threshold":     float(best_threshold),
+        "undersampling_ratio":   request.undersampling_ratio,
+        "effective_date_range":  effective_date_range,
+        "max_history_days":      request.max_history_days,
         "baseline_distributions": baseline_distributions,
     }
 
     optuna_result = OptunaResult(
-        best_trial_number=int(study.best_trial.number),
-        best_f1_score=float(round(best_f1, 4)),
-        best_params=best_params,
+        best_trial_number = int(study.best_trial.number),
+        best_f1_score     = float(round(best_f1, 4)),
+        best_params       = best_params,
     )
 
     response = TrainingResponse(
-        metrics=metrics,
-        optuna_result=optuna_result,
-        model_base64=model_bytes,
-        model_config_dict=model_config,
-        promotion_status=promotion_status,
-        total_samples=len(df),
-        train_samples=len(X_train),
-        test_samples=len(X_test),
-        class_distribution=class_dist,
-        fraud_ratio_balanced=float(round(fraud_ratio_balanced, 4)),
+        metrics              = metrics,
+        optuna_result        = optuna_result,
+        model_base64         = model_bytes,
+        model_config_dict    = model_config,
+        promotion_status     = promotion_status,
+        total_samples        = len(df_full),
+        train_samples        = len(X_train),
+        test_samples         = len(X_test),
+        class_distribution   = class_dist,
+        fraud_ratio_balanced = float(round(fraud_ratio_balanced, 4)),
+        half_life_days       = request.half_life_days,
+        effective_date_range = effective_date_range,
     )
 
     # =========================================================================
-    # 16. PERSISTIR EN BASE DE DATOS
-    # Nota: la subida a DagsHub ocurre FUERA del session de BD para no
-    #       mantener conexiones abiertas durante el upload (puede tardar 30-60s).
+    # 20. PERSISTIR EN BASE DE DATOS
     # =========================================================================
     logger.info("💾 Guardando resultados en base de datos...")
-
-    model_version = f"fraud_v1.0_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     model_id = None
 
     try:
         with get_db_session() as session:
-            # 1. Dataset info
             dataset_id = model_registry.save_dataset_info(
-                session=session,
-                start_date=request.start_date,
-                end_date=request.end_date,
-                total_samples=len(df),
-                count_train=len(X_train),
-                count_test=len(X_test),
-                fraud_ratio=float(round(fraud_ratio_balanced, 4)),
-                undersampling_ratio=request.undersampling_ratio,
+                session          = session,
+                start_date       = str(ts_min.date()),
+                end_date         = str(ts_max.date()),
+                total_samples    = len(df_full),
+                count_train      = len(X_train),
+                count_test       = len(X_test),
+                fraud_ratio      = float(round(fraud_ratio_balanced, 4)),
+                undersampling_ratio = request.undersampling_ratio,
             )
 
-            # 2. Model metadata
             model_id = model_registry.save_model_metadata(
-                session=session,
-                model_version=model_version,
-                algorithm="XGBoost + IsolationForest",
-                model_config=model_config,
-                threshold=float(best_threshold),
-                promotion_status=promotion_status,
+                session          = session,
+                model_version    = model_version,
+                algorithm        = "XGBoost + IsolationForest",
+                model_config     = model_config,
+                threshold        = float(best_threshold),
+                promotion_status = promotion_status,
             )
 
-            # 3. Audit record
             if request.audit_id:
                 logger.info("📝 Actualizando audit record %s (flujo Java)", request.audit_id)
                 model_registry.update_audit_with_results(
-                    session=session,
-                    audit_id=request.audit_id,
-                    id_dataset=dataset_id,
-                    id_model=model_id,
-                    end_training=datetime.now(),
-                    metrics={
-                        "accuracy": float(metrics.accuracy),
-                        "precision": float(metrics.precision),
-                        "recall": float(metrics.recall),
-                        "f1_score": float(metrics.f1_score),
-                        "auc_roc": float(metrics.auc_roc),
+                    session          = session,
+                    audit_id         = request.audit_id,
+                    id_dataset       = dataset_id,
+                    id_model         = model_id,
+                    end_training     = datetime.now(),
+                    metrics          = {
+                        "accuracy":          float(metrics.accuracy),
+                        "precision":         float(metrics.precision),
+                        "recall":            float(metrics.recall),
+                        "f1_score":          float(metrics.f1_score),
+                        "auc_roc":           float(metrics.auc_roc),
                         "optimal_threshold": float(metrics.optimal_threshold),
                     },
-                    optuna_result={
-                        "trials": request.optuna_trials,
-                        "best_trial_number": int(optuna_result.best_trial_number),
-                        "best_f1_score": float(optuna_result.best_f1_score),
-                        "best_params": best_params,
+                    optuna_result    = {
+                        "trials":             request.optuna_trials,
+                        "best_trial_number":  int(optuna_result.best_trial_number),
+                        "best_f1_score":      float(optuna_result.best_f1_score),
+                        "best_params":        best_params,
                     },
-                    promotion_status=promotion_status,
-                    promotion_reason=promotion_reason or f"Java training - {promotion_status}",
-                    id_champion_model=id_champion_model,
-                    champion_metrics=champion_metrics,
-                    is_success=True,
+                    promotion_status = promotion_status,
+                    promotion_reason = promotion_reason or f"Java training - {promotion_status}",
+                    id_champion_model = id_champion_model,
+                    champion_metrics = champion_metrics,
+                    is_success       = True,
                 )
             else:
                 logger.info("📝 Creando audit record completo (flujo manual)")
                 model_registry.save_complete_audit_record(
-                    session=session,
-                    id_dataset=dataset_id,
-                    id_model=model_id,
-                    start_training=datetime.fromtimestamp(start_time),
-                    end_training=datetime.now(),
-                    metrics={
-                        "accuracy": float(metrics.accuracy),
-                        "precision": float(metrics.precision),
-                        "recall": float(metrics.recall),
-                        "f1_score": float(metrics.f1_score),
-                        "auc_roc": float(metrics.auc_roc),
+                    session          = session,
+                    id_dataset       = dataset_id,
+                    id_model         = model_id,
+                    start_training   = datetime.fromtimestamp(start_time),
+                    end_training     = datetime.now(),
+                    metrics          = {
+                        "accuracy":          float(metrics.accuracy),
+                        "precision":         float(metrics.precision),
+                        "recall":            float(metrics.recall),
+                        "f1_score":          float(metrics.f1_score),
+                        "auc_roc":           float(metrics.auc_roc),
                         "optimal_threshold": float(metrics.optimal_threshold),
                     },
-                    optuna_result={
-                        "trials": request.optuna_trials,
-                        "best_trial_number": int(optuna_result.best_trial_number),
-                        "best_f1_score": float(optuna_result.best_f1_score),
-                        "best_params": best_params,
+                    optuna_result    = {
+                        "trials":             request.optuna_trials,
+                        "best_trial_number":  int(optuna_result.best_trial_number),
+                        "best_f1_score":      float(optuna_result.best_f1_score),
+                        "best_params":        best_params,
                     },
-                    promotion_status=promotion_status,
-                    promotion_reason=promotion_reason or f"Manual training - {promotion_status}",
-                    id_champion_model=id_champion_model,
-                    champion_metrics=champion_metrics,
-                    triggered_by=request.triggered_by,
-                    is_success=True,
+                    promotion_status = promotion_status,
+                    promotion_reason = promotion_reason or f"Manual training - {promotion_status}",
+                    id_champion_model = id_champion_model,
+                    champion_metrics = champion_metrics,
+                    triggered_by     = request.triggered_by,
+                    is_success       = True,
                 )
 
-            # Un único commit para dataset + model + audit
             session.commit()
             logger.info(
                 "✅ Datos guardados: dataset_id=%s, model_id=%s, model_version=%s",
@@ -544,49 +652,45 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
         return response
 
     # =========================================================================
-    # 17. SUBIR MODELO A DAGSHUB (fuera del session de BD)
+    # 21. SUBIR MODELO A DAGSHUB (fuera del session de BD)
     # =========================================================================
     if model_id is not None:
         logger.info("📤 Subiendo modelo a DagsHub...")
         try:
             from fraude.dagshub_client import upload_champion as dagshub_upload
-
             dagshub_url, model_size_mb = dagshub_upload(
-                model_bytes=raw_model_bytes,
-                version_tag=model_version,
+                model_bytes = raw_model_bytes,
+                version_tag = model_version,
             )
-
             if dagshub_url:
                 logger.info("✅ Modelo subido a DagsHub: %s", dagshub_url)
-                # Actualizar URL con una sesión nueva, independiente del commit anterior
                 try:
                     with get_db_session() as session_url:
                         model_registry.update_model_dagshub_url(
-                            session=session_url,
-                            model_id=model_id,
-                            dagshub_url=dagshub_url,
-                            model_size_mb=model_size_mb,
+                            session      = session_url,
+                            model_id     = model_id,
+                            dagshub_url  = dagshub_url,
+                            model_size_mb = model_size_mb,
                         )
                         session_url.commit()
                 except Exception:
                     logger.warning("⚠️ No se pudo actualizar URL DagsHub en BD", exc_info=True)
             else:
                 logger.warning("⚠️ DagsHub no devolvió URL. Modelo no vinculado.")
-
         except Exception:
             logger.warning("⚠️ No se pudo subir modelo a DagsHub. Continuando.", exc_info=True)
 
     # =========================================================================
-    # 18. PROMOCIÓN A CHAMPION (sesión separada — después del commit de datos)
+    # 22. PROMOCIÓN A CHAMPION (sesión independiente)
     # =========================================================================
     if promotion_status == "PROMOTED" and model_id is not None:
         logger.info("🏆 Promoviendo modelo a CHAMPION...")
         try:
             with get_db_session() as session_promo:
                 success = model_registry.promote_model_to_champion(
-                    session=session_promo,
-                    model_id=model_id,
-                    promotion_reason=promotion_reason or "Promoted based on metrics",
+                    session          = session_promo,
+                    model_id         = model_id,
+                    promotion_reason = promotion_reason or "Promoted based on metrics",
                 )
                 if success:
                     session_promo.commit()
@@ -595,8 +699,9 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
                     logger.warning("⚠️ promote_model_to_champion retornó False")
         except Exception:
             logger.exception("❌ Error al promover modelo a CHAMPION")
-            # No sobreescribir promotion_status — el modelo ya está guardado con PROMOTED en BD
 
-    training_time_total = time.time() - start_time
-    logger.info("✅ Entrenamiento completado en %.1fs", training_time_total)
+    total_training_time = time.time() - start_time
+    logger.info("✅ Autoentrenamiento completado en %.1fs", total_training_time)
+    logger.info("   Rango efectivo: %s", effective_date_range)
+    logger.info("   Decay: half_life=%d días, λ=%.6f", request.half_life_days, lam)
     return response
