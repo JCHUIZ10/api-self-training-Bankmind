@@ -43,6 +43,7 @@ class SelfTrainingAuditWithdrawalModel(Base):
     start_training = Column(DateTime)
     end_training = Column(DateTime)
     hyperparameters = Column(JSON)
+    psi_baseline = Column(JSON)
     is_production = Column(Boolean)
     compared_to_model = Column(Integer)
     id_dataset_withdrawal_prediction = Column(Integer)
