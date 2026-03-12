@@ -91,7 +91,7 @@ class ModelOptimizer:
 
         logger.info(f"🔍 Iniciando Optuna ({n_trials} trials, {n_splits} splits)...")
         study = optuna.create_study(direction="minimize")
-        study.optimize(objective, n_trials=n_trials)
+        study.optimize(objective, n_trials=n_trials) # type: ignore
 
         logger.info(
             f"✅ Mejor MAPE CV: {study.best_value:.4f} | "

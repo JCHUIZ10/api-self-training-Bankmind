@@ -3,8 +3,11 @@ import os
 import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
 
 logger = logging.getLogger(__name__)
+
+load_dotenv()  # Carga .env si existe
 
 # Credenciales de BD (matching Java backend)
 DB_USER = os.getenv("DB_USER", "postgres")

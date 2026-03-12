@@ -82,7 +82,7 @@ class DataPreprocessor:
     @staticmethod
     def aplicar_transformacion(y: pd.Series) -> pd.Series:
         """Aplica transformación logarítmica log1p para estabilizar varianza."""
-        return np.log1p(y)
+        return np.log1p(y) # type: ignore
 
     @staticmethod
     def invertir_transformacion(y: np.ndarray) -> np.ndarray:

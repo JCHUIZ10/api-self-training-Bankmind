@@ -65,7 +65,7 @@ class ModelEvaluator:
         )
         importancias = importancias.sort_values("porcentaje", ascending=False)
 
-        return importancias.set_index("feature")["porcentaje"].to_dict()
+        return importancias.set_index("feature")["porcentaje"].to_dict() # type: ignore
 
     @staticmethod
     def calcular_intervalo_confianza(
