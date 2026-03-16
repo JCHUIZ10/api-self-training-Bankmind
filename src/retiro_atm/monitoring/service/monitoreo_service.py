@@ -88,7 +88,13 @@ def recuperar_predicciones_faltantes(
     Detecta transacciones sin predicción y las envía a la API.
     Retorna el DataFrame actualizado con las nuevas predicciones.
     """
+
+    # Asegurar que la columna exista
+    if "predicted_value" not in df_real_vs_pred.columns:
+        df_real_vs_pred["predicted_value"] = None
+
     faltantes = df_real_vs_pred[df_real_vs_pred["predicted_value"].isnull()]
+
     if faltantes.empty:
         logger.info("No hay predicciones faltantes.")
         return df_real_vs_pred
@@ -96,43 +102,64 @@ def recuperar_predicciones_faltantes(
     ids_faltantes = tuple(faltantes["id_transaction"].tolist())
     logger.info("Predicciones faltantes: %d transacciones", len(ids_faltantes))
 
-    # Usamos raw_connection solo para el cursor psycopg2 (execute_batch)
     raw_conn = engine.raw_connection()
+
     try:
         datos = repo.obtener_datos_faltantes(raw_conn, ids_faltantes)
         payload = [item.model_dump(mode="json") for item in datos]
 
         response = requests.post(PREDICTION_API_URL, json=payload, timeout=30)
         response.raise_for_status()
+
         predicciones = response.json()
         logger.info("API respondió %d predicciones", len(predicciones))
 
-        # Insertar predicciones — commit explícito dentro de insertar_predicciones
+        # Guardar en BD
         repo.insertar_predicciones(raw_conn, predicciones, model_id, margen)
         raw_conn.commit()
 
-        # Actualizar el DataFrame en memoria
+        # Convertir predicciones a DataFrame
         df_nuevas = pd.DataFrame(predicciones).rename(columns={
-            "atm":             "id_atm",
+            "atm": "id_atm",
             "prediction_date": "transaction_date",
-            "retiro":          "predicted_value",
+            "retiro": "predicted_value",
         })
-        df_nuevas["transaction_date"] = pd.to_datetime(df_nuevas["transaction_date"])
-        df_real_vs_pred = df_nuevas.merge(
-            df_real_vs_pred, on=["id_atm", "transaction_date"], how="left"
+
+        df_nuevas["transaction_date"] = pd.to_datetime(
+            df_nuevas["transaction_date"]
+        )
+
+        # Crear mapa para actualización rápida
+        mapa_predicciones = {
+            (row.id_atm, row.transaction_date): row.predicted_value
+            for row in df_nuevas.itertuples()
+        }
+
+        # Actualizar solo valores faltantes
+        mask = df_real_vs_pred["predicted_value"].isna()
+
+        df_real_vs_pred.loc[mask, "predicted_value"] = (
+            df_real_vs_pred.loc[mask]
+            .apply(
+                lambda r: mapa_predicciones.get(
+                    (r["id_atm"], r["transaction_date"])
+                ),
+                axis=1
+            )
         )
 
     except requests.exceptions.HTTPError as e:
         raw_conn.rollback()
         logger.error("Error HTTP en API de predicción: %s", e.response.text)
+
     except Exception as e:
         raw_conn.rollback()
         logger.exception("Error al recuperar predicciones: %s", e)
+
     finally:
         raw_conn.close()
 
     return df_real_vs_pred
-
 
 # ══════════════════════════════════════════════════════════════════
 # 3. MÉTRICAS DE ERROR
