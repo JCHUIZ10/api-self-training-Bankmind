@@ -74,8 +74,7 @@ def ejecutar_monitoreo(engine) -> None:
         )
         error_veredicto, icono = obtener_veredicto_error(mape)
         logger.info(
-            "%s Métricas — MAE: %.2f | RMSE: %.2f | MAPE: %.2f%% → %s",
-            icono, mae, rmse, mape, error_veredicto,
+            f"{icono} Métricas — MAE: {mae:.2f} | RMSE: {rmse:.2f} | MAPE: {mape:.2f}% → {error_veredicto}"
         )
 
         # ── 5. PSI ───────────────────────────────────────────────

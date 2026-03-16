@@ -42,10 +42,12 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
     try:
         # ─── 1. Cargar datos ───
         logger.info("═══ PASO 1/10: Cargando datos ═══")
+        print("═══ PASO 1/10: Cargando datos ═══")
         df = load_dataset()
 
         # ─── 2. Preprocesar ───
         logger.info("═══ PASO 2/10: Preprocesando datos ═══")
+        print("═══ PASO 2/10: Preprocesando datos ═══")
         data = DataPreprocessor.preparar_datos_completos(
             df,
             dias_test=request.dias_particion_test,
@@ -54,6 +56,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
 
         # ─── 3. Registrar dataset en BD ───
         logger.info("═══ PASO 3/10: Registrando dataset en BD ═══")
+        print("═══ PASO 3/10: Registrando dataset en BD ═══")
         session = database.get_session()
         dataset_record = DatasetWithdrawalPrediction(
             start_date=df["fecha_transaccion"].min().date(),
@@ -67,24 +70,30 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
         session.add(dataset_record)
         session.commit()
         logger.info(f"📝 Dataset registrado con ID: {dataset_record.id}")
+        print(f"📝 Dataset registrado con ID: {dataset_record.id}")
 
         # ─── 4. Analisis de Distribucion de datos ───
         logger.info("═══ PASO 5/10: Analisis de Distribucion de Datos (PSI) ═══")
+        print("═══ PASO 5/10: Analisis de Distribucion de Datos (PSI) ═══")
         data_distribution = obtener_distribucion_actual_atm_features()
         psi = get_psi(data_distribution)
         logger.info(f"PSI: calculado exitosamente")
+        print(f"PSI: calculado exitosamente")
 
         # ─── 5. Optimizar hiperparámetros ───
         logger.info("═══ PASO 6/10: Optimización Optuna ═══")
+        print("═══ PASO 6/10: Optimización Optuna ═══")
         study = ModelOptimizer.optimizar_hiperparametros(
             X_train=data.train.X,
             y_train_log=data.train.y_log,
             n_trials=request.optuna_trials,
         )
         best_params = study.best_params
+        print(f"Best params: {best_params}")
 
         # ─── 6. Entrenar modelo final ───
         logger.info("═══ PASO 6/10: Entrenando modelo final ═══")
+        print("═══ PASO 6/10: Entrenando modelo final ═══")
         new_model = ModelOptimizer.entrenar_modelo_final(
             best_params=best_params,
             X_train=data.train_final.X,
@@ -96,6 +105,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
 
         # ─── 7. Evaluar nuevo modelo ───
         logger.info("═══ PASO 7/10: Evaluando challenger ═══")
+        print("═══ PASO 7/10: Evaluando challenger ═══")
         training_time = time.time() - start_time
         metrics_beta = ModelEvaluator.evaluar_modelo(
             new_model, data.test.X, data.test.y,
@@ -114,6 +124,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
 
         # ─── 8. Descargar y evaluar champion ───
         logger.info("═══ PASO 8/10: Evaluando champion actual ═══")
+        print("═══ PASO 8/10: Evaluando champion actual ═══")
         provider = AtmModelProvider()
         provider.init_dagshub_connection()
         champion_model = provider.obtener_modelo_produccion(force_download=True)
@@ -136,6 +147,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
 
         # ─── 9. Decidir promoción ───
         logger.info("═══ PASO 9/10: Decidiendo promoción ═══")
+        print("═══ PASO 9/10: Decidiendo promoción ═══")
         deployment_status = "KEEP_CHAMPION"
         version_tag = None
         margin_improvement = None
@@ -155,6 +167,7 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
             # Cold start: no hay champion, promover automáticamente
             should_promote = True
             logger.info("🆕 Cold start: no hay champion, promoviendo nuevo modelo")
+            print("🆕 Cold start: no hay champion, promoviendo nuevo modelo")
 
         # Registrar auditoría independiente a si se promueve o no
         audit = _registrar_self_training_audit_withdrawal_model(
@@ -167,8 +180,10 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
             dataset_id=dataset_record.id, # type: ignore
             psi=psi,
         )
+        print(f"Audit registrada: {audit}")
 
         if should_promote:
+            print("Promoviendo nuevo modelo")
             deployment_status = _promover_modelo(
                 session = session ,
                 new_model = new_model,
@@ -181,10 +196,13 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
             if deployment_status == "NEW_CHAMPION":
                 ultima_version = audit.model_name
                 version_tag = f"v{ultima_version}"
+                print(f"Version tag: {version_tag}")
                 dagshub_verified = AtmModelProvider.verificar_integridad(version_tag)
+                print(f"Dagshub verified: {dagshub_verified}")
 
         # ─── 10. Log MLflow ───
         logger.info("═══ PASO 10/10: Logging MLflow ═══")
+        print("═══ PASO 10/10: Logging MLflow ═══")
         _log_mlflow(
             challenger_metrics, champion_metrics, best_params,
             study.best_value, deployment_status,
@@ -234,9 +252,19 @@ def _registrar_self_training_audit_withdrawal_model (
     try:
         # Obtener versión
         name_model = type(new_model).__name__ or "ATM model prediction"
+        print(f"Name model: {name_model}")
 
         ultima_version = consultar_ultima_version_modelo(name_model)
         version_tag = f"{name_model}_v{ultima_version + 1}"
+        print(f"Version tag: {version_tag}")
+
+        # Obtener modelo actual
+        model_rival = (
+            session.query(SelfTrainingAuditWithdrawalModel)
+            .filter(SelfTrainingAuditWithdrawalModel.is_production == True)
+            .first()
+        )
+        print(f"Modelo actual: {model_rival}")
 
         # Guardar auditoría
         audit = SelfTrainingAuditWithdrawalModel(
@@ -251,14 +279,15 @@ def _registrar_self_training_audit_withdrawal_model (
             start_training=start_datetime,
             end_training=datetime.now(),
             hyperparameters=best_params,
-            is_production=True,
-            compared_to_model=int(ultima_version) if ultima_version else None,
+            is_production=False,
+            compared_to_model=model_rival.id if model_rival else None,
             id_dataset_withdrawal_prediction=dataset_id,
             psi_baseline=psi,
         )
         session.add(audit)
         session.commit()
         logger.info(f"📝 Auditoría guardada: {version_tag} (ID: {audit.id})")
+        print(f"📝 Auditoría guardada: {version_tag} (ID: {audit.id})")
         return audit
     except Exception as e:
         logger.error(f"❌ Error al registrar auditoría: {e}")
@@ -296,11 +325,12 @@ def _promover_modelo(
                 SelfTrainingAuditWithdrawalModel.id
                 == modelo_actual.id_self_training_audit_withdrawal_model
             ).update({"is_production": False})
-            logger.info(f"🔄 Modelo anterior (ID: {modelo_actual.id}) desactivado")
+            logger.info(f"🔄 Modelo rival (ID: {modelo_actual.id}) desactivado")
+            print(f"🔄 Modelo rival (ID: {modelo_actual.id}) desactivado")
 
         # Activar nuevo modelo
         new_production = WithdrawalModel(
-            confidence_level=ic.get("confidence_level", 95.0),
+            confidence_level=ic.get("confidence_level", 95),
             end_date=None,
             is_active=True,
             margin=ic["margin_error"],
@@ -311,13 +341,17 @@ def _promover_modelo(
             importances_features=importancias,
         )
         session.add(new_production)
+
+        audit.is_production = True
+        session.add(audit)
         session.commit()
         logger.info(f"✅ Nuevo modelo activado (ID: {new_production.id})")
-
+        print(f"✅ Nuevo modelo activado (ID: {new_production.id})")
         # Subir a DagsHub
         uploaded = provider.actualizar_modelo_produccion(new_model, audit.model_name) # type: ignore
         if not uploaded:
             logger.error("❌ Fallo al subir a DagsHub")
+            print("❌ Fallo al subir a DagsHub")
             return "UPLOAD_FAILED"
 
         # Notificar backend Java

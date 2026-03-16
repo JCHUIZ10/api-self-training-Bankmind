@@ -58,23 +58,29 @@ def load_dataset() -> pd.DataFrame:
 
 def consultar_ultima_version_modelo(nombre_modelo:str) -> int:
     """
-    Consulta el ID máximo de la tabla de auditoría para calcular
-    el siguiente version_tag.
-
+    Retorna la ultima version del modelo contabilizando si existen versiones
+    del modelo en la tabla de auditoria.
+    
     Returns:
-        ID máximo o 0 si la tabla está vacía.
+        int: ultima version del modelo
     """
     if database.engine is None:
         database.init_db()
 
     try:
-        query = """ 
-        SELECT COUNT(stawm.model_name) 
-        FROM self_training_audit_withdrawal_model stawm 
-        WHERE stawm.model_name ILIKE '%' || :model_name || '%'
-        """
-        result = pd.read_sql(query, database.engine, params={"model_name": nombre_modelo})
-        return int(result.iloc[0, 0]) # type: ignore
+        # 1. Usamos text() para declarar la consulta
+        query = text(""" 
+            SELECT COUNT(stawm.model_name) 
+            FROM self_training_audit_withdrawal_model stawm 
+            WHERE stawm.model_name ILIKE '%' || :model_name || '%'
+        """)
+        
+        # 2. Ejecutamos pasando el diccionario de parámetros
+        # Usamos una conexión explícita (buena práctica)
+        with database.engine.connect() as conn:
+            result = pd.read_sql(query, conn, params={"model_name": nombre_modelo})
+            
+        return int(result.iloc[0, 0])
     except Exception as e:
         logger.warning(f"⚠️ No se pudo obtener última versión: {e}")
         return 0
