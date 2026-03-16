@@ -64,7 +64,6 @@ class WithdrawalModel(Base):
     t_crit = Column(Numeric(precision=6, scale=4), nullable=False)
     id_self_training_audit_withdrawal_model = Column(Integer, unique=True, nullable=False)
     importances_features = Column(JSON, nullable=False)
-    psi_baseline = Column(JSON, nullable=True)
 
 
 # ═══════════════════════════════════════════════════════════
