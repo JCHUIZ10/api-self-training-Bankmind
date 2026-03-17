@@ -22,9 +22,9 @@ stack-data==0.6.3
 sqlalchemy
 tqdm==4.67.1
 uvicorn==0.38.0
-xgboost
-lightgbm
-optuna
-mlflow
-shap
-dagshub
+xgboost==3.2.0
+lightgbm==4.6.0
+shap==0.51.0
+optuna==4.7.0
+dagshub==0.6.8
+mlflow==3.10.1

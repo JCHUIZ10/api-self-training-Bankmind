@@ -9,7 +9,6 @@ logger = logging.getLogger(__name__)
 DATASET_VIEW = "v_dataset_atm"
 NAN_CHECK_COLUMNS = 11  # Primeras 11 columnas deben estar completas
 
-
 def load_dataset() -> pd.DataFrame:
     """
     Carga el dataset de retiros ATM desde la vista materializada,

@@ -8,7 +8,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src/'))
 
 # Herramientas de log y monitoreo
 from src.configuration.logging_config import setup_logging
+from dotenv import load_dotenv
 
+load_dotenv()
 # Iniciamos el logging
 setup_logging()
 

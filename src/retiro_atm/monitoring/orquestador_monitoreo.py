@@ -11,19 +11,10 @@ from .service import (
     generar_veredicto_final,
 )
 
-from retiro_atm.training_service import ejecutar_autoentrenamiento
+from retiro_atm.self_train.training_service import ejecutar_autoentrenamiento
 from retiro_atm.schemas import TrainingRequest
 
-# ── Logging ──────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("monitoreo.log", encoding="utf-8"),
-    ],
-)
-logger = logging.getLogger("bankmind.monitor")
+logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════════════════
 # CICLO DE MONITOREO
@@ -38,7 +29,6 @@ def ejecutar_monitoreo(engine) -> None:
       4. PSI
       5. Veredicto final + persistencia
     """
-
     try:
         logger.info("═" * 60)
         logger.info("INICIO DEL CICLO DE MONITOREO")

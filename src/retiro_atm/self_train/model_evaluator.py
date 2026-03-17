@@ -11,7 +11,7 @@ from sklearn.metrics import (
     mean_squared_error,
 )
 
-from retiro_atm.data_preprocessor import DataPreprocessor
+from retiro_atm.self_train.data_preprocessor import DataPreprocessor
 
 logger = logging.getLogger(__name__)
 
