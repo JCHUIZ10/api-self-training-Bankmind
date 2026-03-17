@@ -24,7 +24,7 @@ def get_db_connection():
         # Construir DSN manualmente para evitar problemas de Unicode con el path
         host = os.getenv("DB_HOST", "localhost")
         port = os.getenv("DB_PORT", "5432")
-        database = os.getenv("DB_NAME", "BankMindDB")
+        database = os.getenv("DB_NAME", "BankMindBetta")
         user = os.getenv("DB_USER", "postgres")
         password = os.getenv("DB_PASSWORD", "1234")
         
@@ -53,7 +53,7 @@ def get_db_url():
         f"{os.getenv('DB_PASSWORD', '1234')}@"
         f"{os.getenv('DB_HOST', 'localhost')}:"
         f"{os.getenv('DB_PORT', '5432')}/"
-        f"{os.getenv('DB_NAME', 'BankMindDB')}"
+        f"{os.getenv('DB_NAME', 'BankMindBetta')}"
     )
 
 

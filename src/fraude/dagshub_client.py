@@ -52,8 +52,8 @@ def download_current_champion():
         logger.warning("[WARN] No se puede descargar Champion: Falta Token")
         return None, None, None
 
-    # Using Bearer token for better security/compatibility
-    headers = {'Authorization': f'Bearer {DAGSHUB_TOKEN}'}
+    # DagsHub/Gitea usa el formato 'token' para autenticación
+    headers = {'Authorization': f'token {DAGSHUB_TOKEN}'}
     # Intentar descargar de main/master
     branches = ["main", "master"]
     
@@ -101,8 +101,8 @@ def upload_champion(model_bytes: bytes, version_tag: str):
         repo_fullname = f"{DAGSHUB_REPO_OWNER}/{DAGSHUB_REPO_NAME}"
         logger.info(f"[UPLOAD] Subiendo nuevo Champion ({version_tag}) a {repo_fullname}...")
         
-        # Using Bearer token
-        headers = {'Authorization': f'Bearer {DAGSHUB_TOKEN}'}
+        # DagsHub/Gitea usa el formato 'token' para autenticación
+        headers = {'Authorization': f'token {DAGSHUB_TOKEN}'}
         
         # 1) Obtener último commit SHA de la rama main (requerido por DagsHub)
         branch_url = f"https://dagshub.com/api/v1/repos/{DAGSHUB_REPO_OWNER}/{DAGSHUB_REPO_NAME}/branches/main"
@@ -129,7 +129,7 @@ def upload_champion(model_bytes: bytes, version_tag: str):
             'commit_summary': f"Auto-Update Champion: {version_tag}",
             'commit_message': f"Modelo actualizado automaticamente. Version: {version_tag}",
             'commit_choice': 'direct',
-            'versioning': 'dvc',
+            'versioning': 'git',  # El archivo existe en Git (no DVC); usar 'git' evita el HTTP 400 de conflicto
             'last_commit': last_commit
         }
         
@@ -175,8 +175,8 @@ def verify_champion_integrity(expected_version: str) -> bool:
         logger.error("[ERROR] No se puede verificar: Falta Token")
         return False
 
-    # Using Bearer token
-    headers = {'Authorization': f'Bearer {DAGSHUB_TOKEN}'}
+    # DagsHub/Gitea usa el formato 'token' para autenticación
+    headers = {'Authorization': f'token {DAGSHUB_TOKEN}'}
     
     # Intentar descargar desde main (donde recién se subió)
     url = f"https://dagshub.com/{DAGSHUB_REPO_OWNER}/{DAGSHUB_REPO_NAME}/raw/main/{DAGSHUB_MODEL_PATH}"

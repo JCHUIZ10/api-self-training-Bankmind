@@ -557,7 +557,7 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
     # =========================================================================
     # 20. PERSISTIR EN BASE DE DATOS
     # =========================================================================
-    logger.info("💾 Guardando resultados en base de datos...")
+    logger.info("[DB] Guardando resultados en base de datos...")
     model_id = None
 
     try:
@@ -647,7 +647,7 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
             )
 
     except Exception:
-        logger.exception("❌ Error guardando en BD. El entrenamiento fue exitoso pero no se persistió.")
+        logger.exception("[ERROR] Error guardando en BD. El entrenamiento fue exitoso pero no se persistio.")
         response.promotion_status = "PERSISTENCE_ERROR"
         return response
 
