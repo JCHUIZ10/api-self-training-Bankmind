@@ -15,9 +15,9 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Configuración DagsHub desde variables de entorno
-DAGSHUB_REPO_OWNER = os.getenv("DAGSHUB_REPO_OWNER", "notificacionesbankmind")
-DAGSHUB_REPO_NAME = os.getenv("DAGSHUB_REPO_NAME", "Modelos_BankMind_2026")
-DAGSHUB_MODEL_PATH = os.getenv("DAGSHUB_ATM_MODEL_PATH", "modelos/retiro-atm/modelo.pkl")
+DAGSHUB_REPO_OWNER = os.getenv("DAGSHUB_REPO_OWNER")
+DAGSHUB_REPO_NAME = os.getenv("DAGSHUB_REPO_NAME")
+DAGSHUB_MODEL_PATH = os.getenv("DAGSHUB_ATM_MODEL_PATH")
 DAGSHUB_TOKEN = os.getenv("DAGSHUB_USER_TOKEN")
 
 

@@ -4,7 +4,7 @@ import uuid
 from fastapi import APIRouter, HTTPException,BackgroundTasks
 
 from retiro_atm.schemas import TrainingRequest, TrainingResponse
-from retiro_atm import training_service
+from retiro_atm.self_train import training_service
 from retiro_atm.generated.synthetic_data_service import ejecutar_sync
 from retiro_atm.monitoring.orquestador_monitoreo import ejecutar_monitoreo
 from retiro_atm.database import init_db, get_engine 
