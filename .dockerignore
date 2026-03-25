@@ -1,0 +1,29 @@
+# Excluir entorno virtual local
+.venv
+venv
+env
+
+# Excluir cachés de Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Excluir logs generados localmente
+logs/
+*.log
+monitoreo.log
+
+# Excluir control de versiones
+.git
+.gitignore
+
+# Excluir archivos de IDE
+.idea
+.vscode
+*.swp
+
+# Excluir archivos temporales de MLflow
+mlruns/
+artifacts/
