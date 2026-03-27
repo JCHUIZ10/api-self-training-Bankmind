@@ -18,25 +18,23 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Importar routers
-from morosidad.router import router as morosidad_router
-from fraude.router import router as fraude_router
 from retiro_atm.router import router as retiro_atm_router
 
 # Crear app FastAPI
 app = FastAPI(
-    title="BankMind Self-Training API",
-    description="API de auto-retraining para los modelos de BankMind",
+    title="BankMind Self-Training API - Modulo ATM",
+    description="API de auto-retraining para los modelos predictivos de retiro de efectivo en cajeros automaticos",
     version="1.0.0"
 )
 
 # Registrar routers
-app.include_router(morosidad_router)
-app.include_router(fraude_router)
 app.include_router(retiro_atm_router)
 
-
-@app.get("/health")
+@app.get("/health",tags=["Verificación de la disponibilidad de la api"])
 async def health():
+    """
+    Endpoint para verificar si esta funcionando la API
+    """
     return {"status": "ok", "service": "self-training-api"}
 
 

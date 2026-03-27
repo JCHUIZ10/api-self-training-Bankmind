@@ -2,7 +2,7 @@ import logging
 from logging.config import dictConfig
 from pathlib import Path
 
-LOG_DIR = Path("logs")
+LOG_DIR = Path("api-self-training-Bankmind/logs")
 LOG_DIR.mkdir(exist_ok=True)
 
 # Formato común
@@ -57,28 +57,12 @@ LOGGING_CONFIG = {
             "backupCount": 5,
             "formatter": "default",
         },
-        "file_fraude": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": LOG_DIR / "fraude.log",
-            "maxBytes": 5_000_000,
-            "backupCount": 5,
-            "formatter": "default",
-        },
-        "file_morosidad": {
-            "class": "logging.handlers.RotatingFileHandler",
-            "filename": LOG_DIR / "morosidad.log",
-            "maxBytes": 5_000_000,
-            "backupCount": 5,
-            "formatter": "default",
-        },
     },
     "loggers": {
         "retiro_atm.self_train": {"handlers": ["file_retiro_atm_self_train", "console"], "level": "INFO", "propagate": False},
         "retiro_atm.monitoring": {"handlers": ["file_retiro_atm_monitoring", "console"], "level": "INFO", "propagate": False},
         "retiro_atm.generated": {"handlers": ["file_retiro_atm_generated", "console"], "level": "INFO", "propagate": False},
         "retiro_atm": {"handlers": ["file_retiro_atm", "console"], "level": "INFO", "propagate": False},
-        "fraude": {"handlers": ["file_fraude", "console"], "level": "INFO", "propagate": False},
-        "morosidad": {"handlers": ["file_morosidad", "console"], "level": "INFO", "propagate": False},
         "uvicorn": {"level": "INFO"},
         "uvicorn.error": {"level": "INFO"},
         "uvicorn.access": {"level": "INFO"},

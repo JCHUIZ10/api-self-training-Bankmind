@@ -72,13 +72,13 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
         logger.info(f"📝 Dataset registrado con ID: {dataset_record.id}")
 
         # ─── 4. Analisis de Distribucion de datos ───
-        logger.info("═══ PASO 5/10: Analisis de Distribucion de Datos (PSI) ═══")
+        logger.info("═══ PASO 4/10: Analisis de Distribucion de Datos (PSI) ═══")
         data_distribution = obtener_distribucion_actual_atm_features()
         psi = get_psi(data_distribution)
         logger.info(f"PSI: calculado exitosamente")
 
         # ─── 5. Optimizar hiperparámetros ───
-        logger.info("═══ PASO 6/10: Optimización Optuna ═══")
+        logger.info("═══ PASO 5/10: Optimización Optuna ═══")
         study = ModelOptimizer.optimizar_hiperparametros(
             X_train=data.train.X,
             y_train_log=data.train.y_log,
@@ -86,8 +86,8 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
         )
         best_params = study.best_params
 
-        # ─── 6. Entrenar modelo final ───
-        logger.info("═══ PASO 6/10: Entrenando modelo final ═══")
+        # ─── 7. Entrenar modelo final ───
+        logger.info("═══ PASO 7/10: Entrenando modelo final ═══")
         new_model = ModelOptimizer.entrenar_modelo_final(
             best_params=best_params,
             X_train=data.train_final.X,
