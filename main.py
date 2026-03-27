@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Importar routers
-from fraude.router import router as fraude_router
+from fraude.api.router import router as fraude_router
 
 # Crear app FastAPI
 app = FastAPI(

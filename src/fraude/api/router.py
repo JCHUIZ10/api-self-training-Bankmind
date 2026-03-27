@@ -3,15 +3,15 @@ import asyncio
 import logging
 from fastapi import APIRouter, HTTPException
 
-from fraude.fraude_schema import TrainingRequest, TrainingResponse
-from fraude.training_service import entrenar_modelo
-from fraude.drift_service import (
+from fraude.schemas.fraude import TrainingRequest, TrainingResponse
+from fraude.core.training.training_pipeline import entrenar_modelo
+from fraude.core.drift import (
     DriftCalculationRequest,
     DriftCalculationResponse,
     calculate_drift,
 )
-from fraude.clustering_schema import ClusteringRequest, ClusteringResponse
-from fraude.clustering_service import compute_clusters
+from fraude.schemas.clustering import ClusteringRequest, ClusteringResponse
+from fraude.core.clustering import compute_clusters
 
 logger = logging.getLogger(__name__)
 

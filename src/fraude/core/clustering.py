@@ -23,8 +23,8 @@ from dateutil.relativedelta import relativedelta
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
-from fraude.clustering_schema import ClusterProfile, ClusteringRequest, ClusteringResponse
-from fraude.db_config import get_db_connection
+from fraude.schemas.clustering import ClusterProfile, ClusteringRequest, ClusteringResponse
+from fraude.data.db_config import get_db_connection
 
 logger = logging.getLogger(__name__)
 
