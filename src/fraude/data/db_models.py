@@ -207,4 +207,3 @@ class ModelFeatureDrift(Base):
             f"psi={self.psi_value}, "
             f"category='{self.drift_category}')>"
         )
-

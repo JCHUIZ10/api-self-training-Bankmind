@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 # Importar routers
 from morosidad.router import router as morosidad_router
-from fraude.router import router as fraude_router
+from fraude.api.router import router as fraude_router
 from retiro_atm.router import router as retiro_atm_router
 
 # Crear app FastAPI

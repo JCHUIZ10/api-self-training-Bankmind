@@ -10,7 +10,7 @@ from typing import Dict, Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
-from fraude.db_models import FraudModel, DatasetFraudPrediction, SelfTrainingAuditFraud
+from fraude.data.db_models import FraudModel, DatasetFraudPrediction, SelfTrainingAuditFraud
 
 logger = logging.getLogger(__name__)
 

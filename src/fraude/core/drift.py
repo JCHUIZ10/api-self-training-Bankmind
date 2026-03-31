@@ -26,8 +26,8 @@ from dateutil.relativedelta import relativedelta
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from fraude.db_config import get_db_session
-from fraude.data_extraction import get_raw_transactions
+from fraude.data.db_config import get_db_session
+from fraude.data.data_extraction import get_raw_transactions
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def _get_champion_model_config(session: Session) -> Optional[Dict]:
     Lee el model_config del CHAMPION activo (contiene baseline_distributions).
     Retorna el dict parseado o None si no hay champion o falta el baseline.
     """
-    from fraude import model_registry
+    from fraude.data import model_registry
     champion = model_registry.get_current_champion(session)
     if not champion:
         logger.warning("No hay modelo CHAMPION activo. PSI no disponible.")
@@ -170,7 +170,7 @@ def _persist_drift_results(
     drift_results: List[FeatureDriftResult],
 ) -> None:
     """Persiste los resultados de PSI en model_feature_drift."""
-    from fraude.db_models import ModelFeatureDrift as ModelFeatureDriftORM
+    from fraude.data.db_models import ModelFeatureDrift as ModelFeatureDriftORM
     for result in drift_results:
         record = ModelFeatureDriftORM(
             id_model=id_model,
