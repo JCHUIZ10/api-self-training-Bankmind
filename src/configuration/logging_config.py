@@ -28,6 +28,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_retiro_atm_self_train": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -35,6 +36,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_retiro_atm_monitoring": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -42,6 +44,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_retiro_atm_generated": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -49,6 +52,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_retiro_atm": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -56,6 +60,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_fraude": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -63,6 +68,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
         "file_morosidad": {
             "class": "logging.handlers.RotatingFileHandler",
@@ -70,6 +76,7 @@ LOGGING_CONFIG = {
             "maxBytes": 5_000_000,
             "backupCount": 5,
             "formatter": "default",
+            "encoding": "utf-8"
         },
     },
     "loggers": {

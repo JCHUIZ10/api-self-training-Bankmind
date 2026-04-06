@@ -72,13 +72,13 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
         logger.info(f"📝 Dataset registrado con ID: {dataset_record.id}")
 
         # ─── 4. Analisis de Distribucion de datos ───
-        logger.info("═══ PASO 5/10: Analisis de Distribucion de Datos (PSI) ═══")
+        logger.info("═══ PASO 4/10: Analisis de Distribucion de Datos (PSI) ═══")
         data_distribution = obtener_distribucion_actual_atm_features()
         psi = get_psi(data_distribution)
         logger.info(f"PSI: calculado exitosamente")
 
         # ─── 5. Optimizar hiperparámetros ───
-        logger.info("═══ PASO 6/10: Optimización Optuna ═══")
+        logger.info("═══ PASO 5/10: Optimización Optuna ═══")
         study = ModelOptimizer.optimizar_hiperparametros(
             X_train=data.train.X,
             y_train_log=data.train.y_log,
@@ -86,8 +86,8 @@ def ejecutar_autoentrenamiento(request: TrainingRequest) -> TrainingResponse:
         )
         best_params = study.best_params
 
-        # ─── 6. Entrenar modelo final ───
-        logger.info("═══ PASO 6/10: Entrenando modelo final ═══")
+        # ─── 7. Entrenar modelo final ───
+        logger.info("═══ PASO 7/10: Entrenando modelo final ═══")
         new_model = ModelOptimizer.entrenar_modelo_final(
             best_params=best_params,
             X_train=data.train_final.X,
@@ -322,7 +322,7 @@ def _promover_modelo(
         )
         session.add(new_production)
 
-        audit.is_production = True
+        audit.is_production = True # type: ignore
         session.add(audit)
         session.commit()
         logger.info(f"✅ Nuevo modelo activado (ID: {new_production.id})")
@@ -347,7 +347,7 @@ def _promover_modelo(
 def _notificar_backend_java():
     """Notifica al backend Java que hay un nuevo modelo disponible."""
     try:
-        response = requests.post(UPDATE_MODEL_API_URL, timeout=10)
+        response = requests.post(UPDATE_MODEL_API_URL, timeout=10) # type: ignore
         response.raise_for_status()
         logger.info(f"📡 Backend Java notificado: {response.json()}")
     except requests.exceptions.RequestException as e:

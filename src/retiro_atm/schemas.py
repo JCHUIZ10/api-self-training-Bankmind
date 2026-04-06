@@ -72,7 +72,7 @@ class WithdrawalModel(Base):
 
 class TrainingRequest(BaseModel):
     """Configuración para iniciar el autoentrenamiento."""
-    optuna_trials: int = 100
+    optuna_trials: int = 50
     tolerancia_mape: float = 0.05
     dias_particion_test: int = 60
     dias_particion_val: int = 15

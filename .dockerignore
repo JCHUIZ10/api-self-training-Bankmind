@@ -1,0 +1,32 @@
+# === Virtualenvs ===
+.venv/
+venv/
+env/
+
+# === Git ===
+.git/
+.gitignore
+
+# === Logs ===
+logs/
+
+# === Python cache ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# === Environment secrets ===
+.env
+
+# === IDE ===
+.idea/
+.vscode/
+*.iml
+*.iws
+*.ipr
+
+# === Docker ===
+Dockerfile
+.dockerignore
+docker-compose*.yml
