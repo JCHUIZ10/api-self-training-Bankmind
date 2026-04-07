@@ -13,6 +13,12 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+
 
 def get_db_connection():
     """
@@ -21,15 +27,8 @@ def get_db_connection():
     Usado para queries raw SQL (ej. data extraction).
     """
     try:
-        # Construir DSN manualmente para evitar problemas de Unicode con el path
-        host = os.getenv("DB_HOST", "localhost")
-        port = os.getenv("DB_PORT", "5432")
-        database = os.getenv("DB_NAME", "BankMindBetta")
-        user = os.getenv("DB_USER", "postgres")
-        password = os.getenv("DB_PASSWORD", "1234")
-        
-        # Usar DSN string en lugar de parámetros individuales
-        dsn = f"host={host} port={port} dbname={database} user={user} password={password}"
+        # Usar DSN string con las variables de entorno
+        dsn = f"host={DB_HOST} port={DB_PORT} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}"
         
         conn = psycopg2.connect(
             dsn,
@@ -48,13 +47,7 @@ def get_db_connection():
 
 def get_db_url():
     """Construye la URL de conexión para SQLAlchemy"""
-    return (
-        f"postgresql://{os.getenv('DB_USER', 'postgres')}:"
-        f"{os.getenv('DB_PASSWORD', '1234')}@"
-        f"{os.getenv('DB_HOST', 'localhost')}:"
-        f"{os.getenv('DB_PORT', '5432')}/"
-        f"{os.getenv('DB_NAME', 'BankMindBetta')}"
-    )
+    return f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 
 # Engine global (creado una vez)
