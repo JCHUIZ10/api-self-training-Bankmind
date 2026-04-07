@@ -28,3 +28,4 @@ shap==0.51.0
 optuna==4.7.0
 dagshub==0.6.8
 mlflow==3.10.1
+imbalanced-learn==0.13.0
