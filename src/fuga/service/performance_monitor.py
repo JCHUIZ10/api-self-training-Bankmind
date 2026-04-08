@@ -57,6 +57,7 @@ class PerformanceMonitorService:
             'dbname':   os.environ.get("DB_NAME",     "BankMindBetta_V3"),
             'user':     os.environ.get("DB_USER",     "postgres"),
             'password': os.environ.get("DB_PASSWORD", "1234"),
+            'options':  '-c client_encoding=UTF8'
         }
 
         # Estado del último análisis
