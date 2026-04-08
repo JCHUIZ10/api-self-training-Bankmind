@@ -6,10 +6,10 @@ Flujo:
 1.  Extrae datos de la BD (account_details + joins)
 2.  Ingeniería de features (TenureByAge, BalanceSalaryRatio, CreditScoreGivenAge)
 3.  Encoding de variables categóricas (Geography → dummies, Gender → binario)
-4.  Split train/test (80/20 estratificado)
+4.  Split train/test estratificado (80/20)
 5.  Escala con StandardScaler
 6.  Balancea con SMOTE sobre el conjunto de entrenamiento
-7.  Optimiza hiperparámetros con GridSearchCV (XGBoost, 3-fold)
+7.  Optimiza hiperparámetros con Optuna (XGBoost, scoring=roc_auc)
 8.  Evalúa el challenger en el conjunto de test
 9.  Champion/Challenger: compara con el modelo en producción (churn_models tabla)
 10. Si el challenger gana: sube combo-pack a DagsHub + hot-reload al servidor principal
@@ -26,12 +26,13 @@ from typing import Optional, Tuple, Dict
 import joblib
 import mlflow
 import mlflow.xgboost
+import optuna
 import pandas as pd
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import (
     accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 )
-from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 from xgboost import XGBClassifier
 
@@ -176,20 +177,46 @@ def entrenar_modelo(request: TrainingRequest) -> TrainingResponse:
     X_res, y_res = sm.fit_resample(X_train_s, y_train)
     logger.info(f"Post-SMOTE: {len(X_res)} muestras, {int(y_res.sum())} churn")
 
-    # 6. GridSearchCV
-    param_grid = {
-        'n_estimators':  [100, 200],
-        'learning_rate': [0.01, 0.1],
-        'max_depth':     [3, 5],
-    }
-    grid = GridSearchCV(
-        XGBClassifier(random_state=42, eval_metric='logloss'),
-        param_grid, cv=3, scoring='roc_auc', n_jobs=1, verbose=0,
+    # 6. Optuna — búsqueda de hiperparámetros XGBoost
+    n_trials = request.optuna_trials
+    logger.info(f"[Optuna] Iniciando optimización de hiperparámetros ({n_trials} trials)...")
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+    def _objective(trial: optuna.Trial) -> float:
+        params = {
+            'n_estimators':      trial.suggest_int('n_estimators',      100, 400),
+            'max_depth':         trial.suggest_int('max_depth',          3,   8),
+            'learning_rate':     trial.suggest_float('learning_rate',    0.01, 0.3,  log=True),
+            'subsample':         trial.suggest_float('subsample',        0.6,  1.0),
+            'colsample_bytree':  trial.suggest_float('colsample_bytree', 0.6,  1.0),
+            'min_child_weight':  trial.suggest_int('min_child_weight',   1,   10),
+            'reg_alpha':         trial.suggest_float('reg_alpha',        0.0,  5.0),
+            'reg_lambda':        trial.suggest_float('reg_lambda',       0.0,  5.0),
+            'random_state': 42,
+            'eval_metric': 'logloss',
+            'n_jobs': 1,
+            'verbosity': 0,
+        }
+        clf = XGBClassifier(**params)
+        clf.fit(X_res, y_res)
+        proba = clf.predict_proba(X_test_s)[:, 1]
+        return float(roc_auc_score(y_test, proba))
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(_objective, n_trials=n_trials)
+
+    best_params = study.best_params
+    logger.info(f"[Optuna] Mejor AUC en prueba: {study.best_value:.4f} — params: {best_params}")
+
+    # Entrenar modelo final con los mejores hiperparámetros sobre todos los datos SMOTE
+    model = XGBClassifier(
+        **best_params,
+        random_state=42,
+        eval_metric='logloss',
+        n_jobs=1,
+        verbosity=0,
     )
-    grid.fit(X_res, y_res)
-    model       = grid.best_estimator_
-    best_params = grid.best_params_
-    logger.info(f"[GridSearch] Mejores params: {best_params}")
+    model.fit(X_res, y_res)
 
     # 7. Evaluación del challenger
     y_pred  = model.predict(X_test_s)

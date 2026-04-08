@@ -5,8 +5,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class TrainingRequest(BaseModel):
     """Request para disparar el auto-entrenamiento del modelo de churn."""
-    triggered_by: str = Field("manual", description="manual | scheduled | drift_detected")
-    audit_id: Optional[int] = Field(None, description="ID de auditoría pre-creado por Java (opcional)")
+    triggered_by:  str          = Field("manual", description="manual | scheduled | drift_detected | performance_monitor")
+    audit_id:      Optional[int] = Field(None,    description="ID de auditoría pre-creado por Java (opcional)")
+    optuna_trials: int           = Field(20,       description="Número de trials Optuna para búsqueda de hiperparámetros (min 5)", ge=5)
 
 
 class TrainingMetrics(BaseModel):

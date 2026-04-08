@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException
 
 from fuga.schemas.churn import TrainingRequest, TrainingResponse
 from fuga.core.training.training_pipeline import entrenar_modelo
+from fuga.service.performance_monitor import performance_monitor
 
 logger = logging.getLogger(__name__)
 
@@ -46,4 +47,39 @@ async def train_churn_model(request: TrainingRequest):
         raise HTTPException(
             status_code=500,
             detail="Error interno durante el auto-entrenamiento de churn. Revisa los logs.",
+        )
+
+
+@router.get("/monitor/status")
+def get_monitor_status():
+    """
+    Retorna el estado actual del monitor de rendimiento.
+    Incluye métricas de la última evaluación, próxima evaluación programada,
+    y configuración del monitor.
+    """
+    return performance_monitor.get_status()
+
+
+@router.post("/monitor/evaluate")
+def trigger_evaluation():
+    """
+    Evalúa el rendimiento del modelo contra ground truth y persiste el resultado.
+    """
+    try:
+        result = performance_monitor.evaluate_model_performance()
+
+        if result.get("status") in ("healthy", "degraded"):
+            trigger_reason = (
+                "manual_evaluation" if result.get("status") == "healthy"
+                else "performance_decay"
+            )
+            performance_monitor._persist_evaluation(
+                result, training_result=None, trigger_reason=trigger_reason
+            )
+
+        return performance_monitor.get_status()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al evaluar rendimiento: {str(e)}"
         )
