@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 from morosidad.router import router as morosidad_router
 from fraude.api.router import router as fraude_router
 from retiro_atm.router import router as retiro_atm_router
+from fuga.api.router import router as fuga_router
+
+# Importar scheduler de monitor
+from fuga.service.monitor_scheduler import setup_churn_monitor, shutdown_churn_monitor
 
 # Crear app FastAPI
 app = FastAPI(
@@ -33,6 +37,18 @@ app = FastAPI(
 app.include_router(morosidad_router)
 app.include_router(fraude_router)
 app.include_router(retiro_atm_router)
+app.include_router(fuga_router)
+
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("[STARTUP] Iniciando monitor de rendimiento Churn...")
+    setup_churn_monitor()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    shutdown_churn_monitor()
 
 
 @app.get("/health")
