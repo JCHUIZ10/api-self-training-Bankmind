@@ -8,17 +8,18 @@ import joblib
 import requests
 import dagshub
 import mlflow
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Configuración DagsHub desde variables de entorno
-DAGSHUB_REPO_OWNER = os.getenv("DAGSHUB_REPO_OWNER")
-DAGSHUB_REPO_NAME = os.getenv("DAGSHUB_REPO_NAME")
-DAGSHUB_MODEL_PATH = os.getenv("DAGSHUB_MODEL_ATM_PATH")
-DAGSHUB_TOKEN = os.getenv("DAGSHUB_USER_TOKEN")
+# ============================================================
+# CONFIGURACIÓN HARDCODEADA — DagsHub ATM (Self-Training)
+# ============================================================
+DAGSHUB_REPO_OWNER = "notificacionesbankmind"
+DAGSHUB_REPO_NAME = "Modelos_BankMind_2026"
+DAGSHUB_MODEL_PATH = "modelos/atm/modelo.pkl"
+DAGSHUB_TOKEN = "1022993058d503226b5e83a649a067c0c2ef2e73"
+
+os.environ["DAGSHUB_USER_TOKEN"] = DAGSHUB_TOKEN
 
 
 class AtmModelProvider:
