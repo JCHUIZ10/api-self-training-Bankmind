@@ -7,7 +7,7 @@ Fuente: account_details + customer + country + gender (PostgreSQL).
 import logging
 import pandas as pd
 
-from fuga.data.db_config import get_db_connection
+from fuga.data.db_config import engine
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ JOIN public.gender   g  ON cu.id_gender    = g.id_gender
 
 def extract_training_data() -> pd.DataFrame:
     """
-    Extrae todos los clientes de la BD para entrenamiento de churn.
+    Extrae todos los clientes de la BD para entrenamiento de churn usando SQLAlchemy engine.
 
     Returns:
         DataFrame con columnas: CreditScore, Geography, Gender, Age, Tenure,
@@ -42,11 +42,18 @@ def extract_training_data() -> pd.DataFrame:
     Raises:
         RuntimeError: Si no se puede conectar a la BD o hay menos de 100 registros.
     """
-    conn = None
     try:
-        conn = get_db_connection()
-        df = pd.read_sql(CHURN_QUERY, conn)
+        with engine.connect() as conn:
+            df = pd.read_sql(CHURN_QUERY, conn)
+        
+        if df.empty:
+            raise RuntimeError("La base de datos no devolvió registros de clientes.")
+
+        # Limpieza Crítica: Asegurar que Exited sea numérico (evita errores de concatenación de strings)
+        df['Exited'] = pd.to_numeric(df['Exited'], errors='coerce').fillna(0).astype(int)
+        
         logger.info(f"Datos extraidos: {len(df)} registros, {df['Exited'].sum()} churn.")
+        
         if len(df) < 100:
             raise RuntimeError(
                 f"Datos insuficientes para entrenar: {len(df)} registros (minimo 100)."
@@ -55,6 +62,3 @@ def extract_training_data() -> pd.DataFrame:
     except Exception:
         logger.exception("Error extrayendo datos de churn")
         raise
-    finally:
-        if conn:
-            conn.close()

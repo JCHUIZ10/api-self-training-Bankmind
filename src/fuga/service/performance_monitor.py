@@ -332,7 +332,7 @@ class PerformanceMonitorService:
                 logger.warning("AUC-ROC omitido: ground truth contiene solo una clase.")
                 return None
 
-            auc = roc_auc_score(y_true, y_score)
+            auc = float(roc_auc_score(y_true, y_score))
             logger.info(f"AUC-ROC calculado: {auc:.4f} ({len(y_score)} muestras con probabilidad)")
             return auc
 
