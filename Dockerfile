@@ -27,11 +27,11 @@ RUN python -m venv /opt/venv && \
 FROM python:3.11.9-slim
 
 LABEL maintainer="BankMind Team"
-LABEL description="API de auto-retraining para modelos predictivos de retiro ATM"
+LABEL description="API de auto-retraining para modelos predictivos de BankMind"
 
 # Solo la librería compartida de PostgreSQL (no el compilador)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libpq5 && \
+    apt-get install -y --no-install-recommends libpq5 libgomp1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
