@@ -6,9 +6,6 @@ import joblib
 import requests
 import dagshub
 import mlflow
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
