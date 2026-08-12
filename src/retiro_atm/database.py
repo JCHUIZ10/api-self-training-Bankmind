@@ -42,9 +42,9 @@ def init_db():
             echo=False,
         )
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        logger.info(f"✅ Conexión a BD configurada: {DB_HOST}:{DB_PORT}/{DB_NAME}")
+        logger.info(f"[DB] Conexión a BD configurada: {DB_HOST}:{DB_PORT}/{DB_NAME}")
     except Exception as e:
-        logger.error(f"❌ Error configurando conexión a BD: {e}")
+        logger.error(f"[DB ERROR] Error configurando conexión a BD: {e}")
         raise e
 
 def get_session():

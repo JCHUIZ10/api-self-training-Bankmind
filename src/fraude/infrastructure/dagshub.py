@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Configuración DagsHub (Hardcoded o env vars)
 DAGSHUB_REPO_OWNER = os.getenv("DAGSHUB_REPO_OWNER", "notificacionesbankmind")
 DAGSHUB_REPO_NAME = os.getenv("DAGSHUB_REPO_NAME", "Modelos_BankMind_2026")
-DAGSHUB_MODEL_PATH = os.getenv("DAGSHUB_MODEL_PATH", "modelos/fraude/modelo.pkl")
+DAGSHUB_MODEL_PATH = os.getenv("DAGSHUB_MODEL_FRAUDE_PATH", "modelos/fraude/modelo.pkl")
 DAGSHUB_TOKEN = os.getenv("DAGSHUB_USER_TOKEN")
 
 _dagshub_initialized = False

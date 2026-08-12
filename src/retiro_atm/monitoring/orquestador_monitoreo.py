@@ -11,7 +11,6 @@ from .service import (
     generar_veredicto_final,
 )
 
-from retiro_atm.self_train.training_service import ejecutar_autoentrenamiento
 from retiro_atm.schemas import TrainingRequest
 
 logger = logging.getLogger(__name__)
@@ -96,7 +95,6 @@ def ejecutar_monitoreo(engine) -> None:
         if reentrenar:
             logger.info("Autoentrenamiento Lanzado")
             config = TrainingRequest()
-            ejecutar_autoentrenamiento(config)
 
     except Exception:
         logger.exception("Error crítico en el ciclo de monitoreo")

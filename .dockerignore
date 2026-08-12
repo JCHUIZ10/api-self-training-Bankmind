@@ -16,9 +16,6 @@ __pycache__/
 *.pyo
 *.pyd
 
-# === Environment secrets ===
-.env
-
 # === IDE ===
 .idea/
 .vscode/
